@@ -91,7 +91,10 @@ class StagedChangesArray(Generic[T]):
 
     #: Modified chunks, as indexed by chunk_states. Index 0 is unused and always None.
     #: Other elements can be None if the chunk has been removed after a resize().
-    chunk_values: list[NDArray[T] | None]
+    #:
+    #: A chunk can alternatively be a callable that lazily returns the chunk value.
+    #: Callable chunks can exist if the array was created by from_chunks().
+    chunk_values: list[NDArray[T] | Callable[[], NDArray[T]] | None]
 
     #: Flag that indicates that the array has been modified.
     _has_changes: bool
@@ -265,7 +268,11 @@ class StagedChangesArray(Generic[T]):
         for base_idx, values_idx in plan.modified:
             chunk = self.chunk_values[values_idx]
             assert chunk is not None
-            yield base_idx, chunk
+            if callable(chunk):
+                if load_base:
+                    yield base_idx, chunk()
+            else:
+                yield base_idx, chunk
 
         for input_idx, sub_indices, base_indices in plan.loads:
             # TODO in case of a change of dtype, this could potentially load the whole
@@ -297,6 +304,8 @@ class StagedChangesArray(Generic[T]):
             values_idx, _, sub_idx = plan.modified[0]
             chunk = self.chunk_values[values_idx]
             assert chunk is not None
+            if callable(chunk):
+                chunk = chunk()
             return chunk[sub_idx]
 
         out = np.empty(plan.shape, dtype=self.dtype)
@@ -304,6 +313,8 @@ class StagedChangesArray(Generic[T]):
         for values_idx, out_idx, sub_idx in plan.modified:
             chunk = self.chunk_values[values_idx]
             assert chunk is not None
+            if callable(chunk):
+                chunk = chunk()
             out[out_idx] = chunk[sub_idx]
 
         for out_idx in plan.full:
@@ -382,6 +393,11 @@ class StagedChangesArray(Generic[T]):
         for idx, out, sub in plan.updates:
             chunk = self.chunk_values[idx]
             assert chunk is not None
+            if callable(chunk):
+                chunk = chunk()
+                if chunk.base is not None:
+                    chunk = chunk.copy()
+                self.chunk_values[idx] = chunk
             if not chunk.flags.writeable:
                 # Duplicate Copy-on-Write (CoW) chunk
                 self.chunk_values[idx] = chunk = chunk.copy()
@@ -418,6 +434,10 @@ class StagedChangesArray(Generic[T]):
         for idx, axis, new_size in plan.updates:
             chunk = self.chunk_values[idx]
             assert chunk is not None
+            if callable(chunk):
+                chunk = chunk()
+                if chunk.base is not None:
+                    chunk.flags.writeable = False
             self.chunk_values[idx] = _resize_array_along_axis(
                 chunk, axis, new_size, fill_value=self.fill_value
             )
@@ -440,7 +460,7 @@ class StagedChangesArray(Generic[T]):
             out._chunk_states = self._chunk_states.copy()
 
         for chunk in self.chunk_values:
-            if chunk is not None:
+            if isinstance(chunk, np.ndarray):
                 chunk.flags.writeable = False
         out.chunk_values = self.chunk_values[:]
         return out
@@ -475,6 +495,8 @@ class StagedChangesArray(Generic[T]):
 
         out.chunk_values = []
         for chunk in self.chunk_values:
+            if callable(chunk):
+                chunk = chunk()
             if chunk is not None:
                 chunk = chunk.astype(dtype, casting=casting)
                 out._has_changes = True
@@ -522,6 +544,8 @@ class StagedChangesArray(Generic[T]):
 
         for i, chunk in enumerate(out.chunk_values):
             if chunk is not None:
+                if callable(chunk):
+                    chunk = chunk()
                 mask = chunk == self.fill_value
                 if mask.any():  # Keep CoW chunks if they are not modified
                     out.chunk_values[i] = chunk = chunk.copy()
@@ -549,6 +573,57 @@ class StagedChangesArray(Generic[T]):
             fill_value=fill_value,
         )
         out._chunk_states = np.full(out.nchunks, -1, dtype=np.intp)
+        return out
+
+    @staticmethod
+    def from_chunks(
+        chunks: Iterable[
+            tuple[tuple[slice, ...], NDArray[T] | Callable[[], NDArray[T]]]
+        ],
+        shape: tuple[int, ...],
+        chunk_size: tuple[int, ...],
+        dtype: DTypeLike | None = None,
+        fill_value: Any | None = None,
+    ) -> StagedChangesArray[T]:
+        """Create a new StagedChangesArray from an iterable of chunks.
+        Omitted chunks are expected to be full of fill_value.
+
+        Parameters
+        ----------
+        chunks:
+            Almost the same format yielded by changes().
+            Iterable of tuples of:
+
+            - index to slice the base array with, always made out of slices that are
+              exactly divisible by the chunk_size
+            - chunk value, or a callable that lazily generates the chunk value.
+
+        Callable chunks:
+
+        - are replaced by their output the first time they're updated by
+          __setitem__, resize(), astype(), or refill();
+        - are executed multiple times if the same chunk is requested
+          multiple times by __getitem__. In other words, there's no cache on read;
+        - are skipped by changes()
+        """
+        out = StagedChangesArray.full(
+            shape=shape,
+            chunk_size=chunk_size,
+            dtype=dtype,
+            fill_value=fill_value,
+        )
+
+        assert out.chunk_values == [None]
+        start_indices = []
+        for idx, chunk in chunks:
+            start_indices.append([slice_.start for slice_ in idx])
+            out.chunk_values.append(chunk)
+
+        if len(out.chunk_values) > 1:
+            chunk_indices = tuple((np.array(start_indices) // chunk_size).T)
+            out.chunk_states[chunk_indices] = np.arange(
+                1, len(out.chunk_values), dtype=np.intp
+            )
         return out
 
 

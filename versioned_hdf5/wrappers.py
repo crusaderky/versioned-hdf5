@@ -12,6 +12,7 @@ import textwrap
 import warnings
 from collections import defaultdict
 from collections.abc import Iterable
+from functools import cached_property, partial
 from typing import Optional, Union
 from weakref import WeakValueDictionary
 
@@ -30,6 +31,15 @@ from .slicetools import build_data_dict
 from .staged_changes import StagedChangesArray
 
 _groups = WeakValueDictionary({})
+
+# As of the hdf5 C library 1.14.3, H5DRead (Dataset.__getitem__) for a virtual dataset
+# suffers from a performance issue where its runtime increases with the total number of
+# chunks in the dataset (not just the number of chunks accessed). This leads to
+# quadratic behaviour when performing many accesses in sequence, like StagedChangesArray
+# does. This flag fundamentally alters the behaviour of StagedChangesArray to read
+# individual chunks from the (non-virtual) raw_data dataset instead.
+# TODO link to issue
+USE_VIRTUAL_GETITEM = False
 
 
 class InMemoryGroup(Group):
@@ -601,13 +611,6 @@ class InMemoryDataset(Dataset):
         self._init_kwargs = kwargs
         self._parent = parent
         self._attrs = dict(super().attrs)
-        self.staged_changes = StagedChangesArray(
-            base_getitem=super().__getitem__,
-            shape=super().shape,
-            chunk_size=self.id.chunks,
-            dtype=super().dtype,
-            fill_value=self.fillvalue,
-        )
 
     def __repr__(self):
         name = posixpath.basename(posixpath.normpath(self.name))
@@ -619,9 +622,35 @@ class InMemoryDataset(Dataset):
             self.dtype.str,
         )
 
-    def build_data_dict(
-        self, load_base: bool = False
-    ) -> dict[Tuple, Slice | np.ndarray]:
+    @cached_property
+    def staged_changes(self) -> StagedChangesArray:
+        if USE_VIRTUAL_GETITEM:
+            return StagedChangesArray(
+                base_getitem=super().__getitem__,
+                shape=super().shape,
+                chunk_size=self.id.chunks,
+                dtype=super().dtype,
+                fill_value=self.fillvalue,
+            )
+        else:
+            return StagedChangesArray.from_chunks(
+                [
+                    (k.raw, partial(self.id.raw_data.__getitem__, v.raw))
+                    for k, v in self.base_data_dict.items()
+                ],
+                shape=super().shape,
+                chunk_size=self.id.chunks,
+                dtype=super().dtype,
+                fill_value=self.fillvalue,
+            )
+
+    @cached_property
+    def base_data_dict(self) -> dict[Tuple, Slice]:
+        """Mapping from slice of the virtual dataset to slice of raw_data.
+
+        Note that, as raw_data is a vertical stack of all the chunks, the index
+        used to slice it can be one-dimensional.
+        """
         dcpl = self.id.get_create_plist()
 
         if dcpl.get_layout() != h5d.VIRTUAL:
@@ -636,6 +665,13 @@ class InMemoryDataset(Dataset):
             data_dict = {empty_idx: Slice(0)}
         else:
             data_dict = build_data_dict(dcpl, self.id.raw_data.name)
+
+        return data_dict
+
+    def build_data_dict(
+        self, load_base: bool = False
+    ) -> dict[Tuple, Slice | np.ndarray]:
+        data_dict = self.base_data_dict.copy()
 
         # This also overwrites deleted chunks with None
         data_dict.update(
@@ -710,7 +746,11 @@ class InMemoryDataset(Dataset):
 
     @property
     def shape(self):
-        return self.staged_changes.shape
+        if "staged_changes" in self.__dict__:
+            # cached property has been set
+            return self.staged_changes.shape
+        else:
+            return super().shape
 
     @property
     def size(self):
