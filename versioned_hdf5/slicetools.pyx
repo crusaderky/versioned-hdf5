@@ -16,6 +16,7 @@ from numpy.typing import ArrayLike
 
 from libc.stddef cimport ptrdiff_t, size_t
 from libc.stdio cimport FILE, fclose
+from libc.stdlib cimport free, malloc
 from libcpp.vector cimport vector
 
 
@@ -110,6 +111,7 @@ np_hsize_t = np.ulonglong
 np_hssize_t = np.longlong
 np_haddr_t = np.longlong
 
+PYOBJECT_SIZE = sys.getsizeof(object())
 NP_GE_200 = np.lib.NumpyVersion(np.__version__) >= "2.0.0"
 
 
@@ -454,6 +456,16 @@ cpdef void read_many_slices(
             src_stride,
             dst_stride,
         )
+    elif isinstance(src, np.ndarray):
+        _read_many_slices_npnp(
+            src,
+            dst,
+            src_start,
+            dst_start,
+            clipped_count,
+            src_stride,
+            dst_stride,
+        )
     else:
         _read_many_slices_slow(
             src,
@@ -644,6 +656,45 @@ cdef void _read_many_slices_fast (
 @cython.wraparound(False)
 @cython.boundscheck(False)
 @cython.infer_types(True)
+cdef void _read_many_slices_npnp (
+    np.ndarray src,
+    np.ndarray dst,
+    const hsize_t[:, :] src_start,
+    const hsize_t[:, :] dst_start,
+    const hsize_t[:, :] count,
+    const hsize_t[:, :] src_stride,
+    const hsize_t[:, :] dst_stride,
+):
+    """Helper of read_many_slices to transfer between two numpy arrays.
+    """
+    nslices, ndim = src_start.shape[:2]
+    src_view_factory = FastNumpyView(src)
+    dst_view_factory = FastNumpyView(dst)
+    src_view = src_view_factory.view
+    dst_view = dst_view_factory.view
+
+    for i in range(nslices):
+        for j in range(ndim):
+            if count[i, j] == 0:
+                break
+        else:
+            # count > 0 along all axes
+            src_view_factory.slice(
+                &src_start[i, 0],
+                &count[i, 0],
+                &src_stride[i, 0],
+            )
+            dst_view_factory.slice(
+                &dst_start[i, 0],
+                &count[i, 0],
+                &dst_stride[i, 0],
+            )
+            np.copyto(dst_view, src_view)
+
+
+@cython.wraparound(False)
+@cython.boundscheck(False)
+@cython.infer_types(True)
 cdef void _read_many_slices_slow (
     src: np.ndarray | h5py.Dataset,
     np.ndarray dst,
@@ -670,6 +721,9 @@ cdef void _read_many_slices_slow (
     basic item sizes (1, 2, 4, and 8 bytes). This has not been attempted yet.
     """
     nslices, ndim = src_start.shape[:2]
+    dst_view_factory = FastNumpyView(dst)
+    dst_view = dst_view_factory.view
+    cdef np.ndarray src_view
 
     for i in range(nslices):
         for j in range(ndim):
@@ -678,18 +732,58 @@ cdef void _read_many_slices_slow (
         else:
             # count > 0 along all axes
             src_idx = []
-            dst_idx = []
             for j in range(ndim):
                 src_start_ij = src_start[i, j]
-                dst_start_ij = dst_start[i, j]
                 count_ij = count[i, j]
                 src_stride_ij = src_stride[i, j]
-                dst_stride_ij = dst_stride[i, j]
-
-                src_stop_ij = count2stop(src_start_ij, count_ij, src_stride_ij)
-                dst_stop_ij = count2stop(dst_start_ij, count_ij, dst_stride_ij)
-
+                src_stop_ij = src_start_ij + count_ij * src_stride_ij
                 src_idx.append(slice(src_start_ij, src_stop_ij, src_stride_ij))
-                dst_idx.append(slice(dst_start_ij, dst_stop_ij, dst_stride_ij))
 
-            dst[tuple(dst_idx)] = src[tuple(src_idx)]
+            src_view = src[tuple(src_idx)]
+            dst_view_factory.slice(
+                &dst_start[i, 0],
+                &count[i, 0],
+                &dst_stride[i, 0],
+            )
+            np.copyto(dst_view, src_view)
+
+
+cdef class FastNumpyView:
+    cdef np.ndarray base
+    cdef np.ndarray view
+    cdef void** data_ptr
+    cdef np.npy_intp* scratch
+
+    def __cinit__(self, np.ndarray base):
+        self.base = base
+        self.view = base[()]
+        self.data_ptr = <void**><size_t>(id(self.view) + PYOBJECT_SIZE)
+        self.scratch = <np.npy_intp*>malloc(sizeof(np.npy_intp) * base.ndim)
+        if not self.scratch:
+            raise MemoryError("could not allocate scratch")
+
+    def __dealloc__(self):
+        free(self.scratch)
+
+    @cython.wraparound(False)
+    @cython.boundscheck(False)
+    @cython.infer_types(True)
+    cdef void slice(
+        self,
+        const hsize_t* start,
+        const hsize_t* count,
+        const hsize_t* strides,
+    ):
+        base = self.base
+        view = self.view
+
+        for i in range(view.ndim):
+            self.scratch[i] = start[i]
+            view.shape[i] = count[i]
+            view.strides[i] = base.strides[i] * strides[i]
+
+        self.data_ptr[0] = np.PyArray_GetPtr(base, self.scratch)
+        np.PyArray_UpdateFlags(
+            view,
+            np.NPY_ARRAY_C_CONTIGUOUS | np.NPY_ARRAY_F_CONTIGUOUS | np.NPY_ARRAY_ALIGNED
+        )
