@@ -764,13 +764,15 @@ class InMemoryDataset(Dataset):
     @with_phil
     def __getitem__(
         self,
-        args: str
-        | slice
-        | tuple
-        | list[int]
-        | list[bool]
-        | np.ndarray
-        | h5r.RegionReference,
+        args: (
+            str
+            | slice
+            | tuple
+            | list[int]
+            | list[bool]
+            | np.ndarray
+            | h5r.RegionReference
+        ),
     ) -> np.ndarray:
         """Read a slice from the HDF5 dataset given by the index.
 
