@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import itertools
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, MutableMapping, TypeVar, cast
@@ -604,25 +605,36 @@ class StagedChangesArray(MutableMapping[Any, T]):
         chunk_size: tuple[int, ...],
         fill_value: Any | None = None,
     ) -> StagedChangesArray:
-        """Create a new StagedChangesArray from an existing array-like.
-
-        NOTE: This method is very naive and always deep-copies the input array.
-        It is intended for demonstration and testing purposes only.
+        """Create a new StagedChangesArray where the base slabs are read-only views
+        (if supported, otherwise deep-copies) of an existing array-like.
         """
-        # Don't double deep-copy array-like objects
+        # Don't deep-copy array-like objects, as long as they allow for views
         arr = cast(np.ndarray, asarray(arr))
 
-        if arr.ndim == 0:
-            raise ValueError("array must have at least one dimension")
-        if len(chunk_size) != arr.ndim:
-            raise ValueError("chunk_size and array dimensionality mismatch")
-
         out = StagedChangesArray.full(arr.shape, chunk_size, fill_value, arr.dtype)
-        out[()] = arr
-        assert len(out.slabs) == 2
-        assert out.n_base_slabs == 0
-        out._get_slab(1).flags.writeable = False
-        out.n_base_slabs = 1
+        n_chunks = out.n_chunks
+
+        # Iterate on all dimensions beyond the first. For each chunk, create a base slab
+        # that is a view of arr of full length along axis 0 and 1 chunk in size along
+        # all other axes.
+        slab_indices = np.arange(1, np.prod(n_chunks[1:]) + 1, dtype=np_hsize_t)
+        out.slab_indices[()] = slab_indices.reshape(n_chunks[1:])[None]
+        slab_offsets = np.arange(0, arr.shape[0], step=chunk_size[0])
+        out.slab_offsets[()] = slab_offsets[(slice(None),) + (None,) * (out.ndim - 1)]
+
+        for chunk_idx in itertools.product(*[list(range(c)) for c in n_chunks[1:]]):
+            view_idx = (slice(None),) + tuple(
+                slice(start := c * s, start + s)
+                for c, s in zip(chunk_idx, chunk_size[1:])
+            )
+            # Note: if the backend of arr doesn't support views
+            # (e.g. h5py.Dataset), this is a deep-copy
+            view = arr[view_idx]
+            if isinstance(view, np.ndarray):
+                view.flags.writeable = False
+            out.slabs.append(view)
+
+        out.n_base_slabs = out.n_slabs - 1
         return out
 
 
