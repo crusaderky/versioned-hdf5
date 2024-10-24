@@ -839,7 +839,6 @@ class GetItemPlan:
             slab_offsets,
             mappers,
             idxidx=True,
-            sort=True,
         )
         self.transfers.extend(
             _make_transfer_plans(
@@ -1012,7 +1011,6 @@ class SetItemPlan(MutatingPlan):
             # arbitrary mapper allows you to select the points on the matching
             # EverythingMappers.
             idxidx=False,
-            sort=n_base_slabs > 0,
             only_partial=True,
         )
         n_partial_chunks = partial_chunks.shape[0]
@@ -1044,7 +1042,6 @@ class SetItemPlan(MutatingPlan):
             slab_offsets,
             mappers,
             idxidx=True,
-            sort=True,
         )
         n_setitem_chunks = setitem_chunks.shape[0]
 
@@ -1118,7 +1115,6 @@ class LoadPlan(MutatingPlan):
             mappers,
             filter=lambda slab_idx: (0 < slab_idx) & (slab_idx <= n_base_slabs),
             idxidx=True,
-            sort=n_base_slabs > 1,
         )
         nchunks = chunks.shape[0]
         if nchunks == 0:
@@ -1216,7 +1212,7 @@ class ChangesPlan:
             mappers,
             filter=lambda slab_idx: slab_idx > 0,
             idxidx=False,
-            sort=False,
+            sort_by_slab=False,
         )
         nchunks = chunks.shape[0]
         ndim = chunks.shape[1] - 2
@@ -1381,7 +1377,6 @@ class ResizePlan(MutatingPlan):
                 mappers,
                 filter=lambda slab_idx: (0 < slab_idx) & (slab_idx <= n_base_slabs),
                 idxidx=True,
-                sort=n_base_slabs > 1,
             )
             nchunks = chunks.shape[0]
             if nchunks > 0:
@@ -1407,7 +1402,6 @@ class ResizePlan(MutatingPlan):
             mappers,
             filter=lambda slab_idx: slab_idx > 0,
             idxidx=True,
-            sort=True,
         )
         nchunks = chunks.shape[0]
 
@@ -1435,7 +1429,7 @@ def _chunks_in_selection(
     mappers: list[IndexChunkMapper],
     filter: Callable[[NDArray[np_hsize_t]], NDArray[np.bool_]] | None = None,
     idxidx: bint = False,
-    sort: bint = False,
+    sort_by_slab: bint = True,
     only_partial: bint = False,
 ) -> hsize_t[:, :]:
     """Find all chunks within a selection
@@ -1454,8 +1448,16 @@ def _chunks_in_selection(
     only_partial: optional
         If True, only return the chunks which are only partially covered by the
         selection along one or more axes.
-    sort: optional
-        If set to True, sort the result by slab_idx before returning it
+    sort_by_slab: optional
+        True (default)
+            The chunks are returned sorted by slab index first and slaf offset next.
+            Sorting by slab index will later allow cutting the result into separate
+            calls to read_many_chunks() later. Sorting by slan offset within eacn slab
+            is to improve access performance on disk-backed storage, where accessing two
+            adjacent chunks will typically avoid a costly seek() syscall and may benefit
+            from glibc-level and/or OS-level buffering.
+        False
+            The chunks are returned sorted by chunk index
     idxidx: optional
         If set to True, return the indices along chunk_indices instead of the values
 
@@ -1599,13 +1601,18 @@ def _chunks_in_selection(
         ret_chunk_indices = [asarray(nz_i, np_hsize_t) for nz_i in nz]
     else:
         ret_chunk_indices = chunk_indices
+    columns = ret_chunk_indices + [filtered_slab_indices, filtered_slab_offsets]
 
-    stacked = np.stack(
-        ret_chunk_indices + [filtered_slab_indices, filtered_slab_offsets],
-        axis=1,
-    )
-    if sort:
-        stacked = stacked[np.argsort(filtered_slab_indices)]
+    stacked = np.empty((filtered_slab_indices.size, ndim + 2), dtype=np_hsize_t)
+
+    if sort_by_slab:
+        sort_idx = np.lexsort((filtered_slab_offsets, filtered_slab_indices))
+        for i, col in enumerate(columns):
+            col.take(sort_idx, axis=0, out=stacked[:, i])
+    else:
+        for i, col in enumerate(columns):
+            stacked[:, i] = col
+
     return stacked
 
 
@@ -1647,7 +1654,6 @@ def _make_transfer_plans(
             All transfers are from a single slab with this index.
         "chunks"
             Transfers are from the slabs pointed to by the slab_idx column in chunks.
-            You must use _chunks_in_selection(..., sort=True) to generate chunks.
         None
             Transfers are from the value parameter of __setitem__.
     dst_slab_idx:
@@ -1657,7 +1663,6 @@ def _make_transfer_plans(
             This is used when filling a brand new slab.
         "chunks"
             Transfers are to the slabs pointed to by the slab_idx column in chunks.
-            You must use _chunks_in_selection(..., sort=True) to generate chunks.
             src_slab_idx can't be "chunks".
         None
             Transfers are to the return value of __getitem__.
@@ -1696,7 +1701,7 @@ def _make_transfer_plans(
     split_indices: ssize_t[:]
     if src_slab_idx == "chunks" or dst_slab_idx == "chunks":
         # Either multiple source slabs and single destination slab, or vice versa
-        # Assumes that _chunks_in_selection was called with sort=True
+        # Note that _chunks_in_selection returns chunks sorted by slab_idx.
         split_indices = np.flatnonzero(np.diff(chunks[:, ndim])) + 1
     else:
         # Single source and destination slabs
