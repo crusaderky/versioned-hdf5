@@ -110,7 +110,7 @@ class StagedChangesArray(MutableMapping[Any, T]):
     slab_indices:
         Numpy array of integers with shape equal to the number of chunks along each
         axis, set to 0 for chunks that are full of fill_value and to i+1 for chunks that
-        lay on base_slabs[i].
+        lie on base_slabs[i].
         It will be modified in place.
     slab_offsets:
         Numpy array of integers with shape matching slab_indices, mapping each chunk to
@@ -125,11 +125,6 @@ class StagedChangesArray(MutableMapping[Any, T]):
 
     #: True if the user called resize() to alter the shape of the array; False otherwise
     _resized: bool
-
-    #: size of the tiles that will be modified at once. A write to
-    #: less than a whole chunk will cause the remainder of the chunk
-    #: to be read from the underlying array.
-    chunk_size: tuple[int, ...]
 
     #: Map from each chunk to the index of the corresponding slab in the slabs list
     slab_indices: NDArray[np_hsize_t]
@@ -182,7 +177,6 @@ class StagedChangesArray(MutableMapping[Any, T]):
             raise ValueError("chunk_size must be strictly positive")
 
         self.shape = shape
-        self.chunk_size = chunk_size
         self._resized = False
 
         dtype = base_slabs[0].dtype if base_slabs else None
@@ -222,13 +216,29 @@ class StagedChangesArray(MutableMapping[Any, T]):
             raise ValueError(f"{self.slab_offsets.shape=}; expected {n_chunks}")
 
     @property
+    def full_slab(self) -> NDArray[T]:
+        return cast(NDArray[T], self.slabs[0])
+
+    @property
     def fill_value(self) -> NDArray[T]:
         """Return array with ndim=0"""
-        return self.slabs[0].base  # type: ignore
+        return cast(NDArray[T], self.full_slab.base)
 
     @property
     def dtype(self) -> np.dtype[T]:
-        return self.fill_value.dtype
+        return self.full_slab.dtype
+
+    @property
+    def chunk_size(self) -> tuple[int, ...]:
+        """Size of the tiles that will be modified at once. A write to
+        less than a whole chunk will cause the remainder of the chunk
+        to be read from the underlying array.
+        """
+        return self.full_slab.shape
+
+    @property
+    def itemsize(self) -> int:
+        return self.full_slab.itemsize
 
     @property
     def ndim(self) -> int:
@@ -244,7 +254,7 @@ class StagedChangesArray(MutableMapping[Any, T]):
         can be less or more depending on duplication between base and staged slabs,
         on full chunks, on chunks referenced multiple times, and on slab fragmentation.
         """
-        return self.size * self.fill_value.nbytes
+        return self.size * self.itemsize
 
     @property
     def n_chunks(self) -> tuple[int, ...]:
@@ -262,11 +272,11 @@ class StagedChangesArray(MutableMapping[Any, T]):
         return self.n_slabs - self.n_base_slabs - 1
 
     @property
-    def base_slabs(self) -> list[NDArray[T] | None]:
+    def base_slabs(self) -> Sequence[NDArray[T] | None]:
         return self.slabs[1 : self.n_base_slabs + 1]
 
     @property
-    def staged_slabs(self) -> list[NDArray[T] | None]:
+    def staged_slabs(self) -> Sequence[NDArray[T] | None]:
         return self.slabs[self.n_base_slabs + 1 :]
 
     @property
@@ -276,14 +286,18 @@ class StagedChangesArray(MutableMapping[Any, T]):
         """
         return self.n_staged_slabs > 0 or self._resized
 
-    def __array__(self) -> NDArray[T]:
-        return self[()]
+    def __array__(self, dtype=None, copy=None) -> NDArray[T]:
+        if copy is False:
+            raise TypeError("Cannot return a ndarray view of a StagedChangesArray")
+        return np.asarray(self[()], dtype=dtype)
 
     def __len__(self) -> int:
         return self.shape[0]
 
     def __iter__(self) -> Iterator[NDArray[T]]:
-        return iter(self[()])
+        c = self.chunk_size[0]
+        for start in range(0, self.shape[0], c):
+            yield from self[start : start + c]
 
     def __delitem__(self, idx: Any) -> None:
         raise ValueError("Cannot delete array elements")
@@ -378,6 +392,8 @@ class StagedChangesArray(MutableMapping[Any, T]):
     ) -> NDArray[T]:
         slab = self.slabs[idx] if idx is not None else default
         assert slab is not None
+        assert slab.dtype == self.dtype, (slab.dtype, self.dtype)
+        assert slab.ndim == self.ndim
         return slab
 
     def changes(
@@ -459,7 +475,7 @@ class StagedChangesArray(MutableMapping[Any, T]):
         """Update the slabs containing the chunks selected by the index.
 
         The full slab (slabs[0]) and the base slabs are read-only. If the selected
-        chunks lay on any of them, append a new empty slab with the necessary space to
+        chunks lie on any of them, append a new empty slab with the necessary space to
         hold all such chunks, then copy the chunks from the full slab or a base slab to
         the new slab, and finally update the new slab from the value parameter.
         """
@@ -583,9 +599,16 @@ class StagedChangesArray(MutableMapping[Any, T]):
         full of fill_value.
         It won't consume any significant amounts of memory until it's modified.
         """
+        # ceil_a_over_b coerces these to unsigned integers. The interpreter will
+        # fail with MemoryError if either shape is negative or chunk_size is zero.
+        if not (s >= 0 for s in shape):
+            raise ValueError("shape must be non-negative")
+        if not all(c for c in chunk_size):
+            raise ValueError("chunk_size must be strictly positive")
         n_chunks = tuple(ceil_a_over_b(s, c) for s, c in zip(shape, chunk_size))
+
         if fill_value is not None:
-            dtype = np.array(fill_value, dtype=dtype).dtype
+            fill_value = np.array(fill_value, dtype=dtype)
         else:
             # StagedChangesArray.__init__ reads the dtype from here
             fill_value = np.zeros((), dtype=dtype)
@@ -612,11 +635,13 @@ class StagedChangesArray(MutableMapping[Any, T]):
         arr = cast(np.ndarray, asarray(arr))
 
         out = StagedChangesArray.full(arr.shape, chunk_size, fill_value, arr.dtype)
-        n_chunks = out.n_chunks
+        if out.size == 0:
+            return out
 
         # Iterate on all dimensions beyond the first. For each chunk, create a base slab
         # that is a view of arr of full length along axis 0 and 1 chunk in size along
         # all other axes.
+        n_chunks = out.n_chunks
         slab_indices = np.arange(1, np.prod(n_chunks[1:]) + 1, dtype=np_hsize_t)
         out.slab_indices[()] = slab_indices.reshape(n_chunks[1:])[None]
         slab_offsets = np.arange(0, arr.shape[0], step=chunk_size[0])
@@ -889,21 +914,6 @@ class MutatingPlan:
         """True if this plan alters the state of the StagedChangesArray"""
         return bool(self.transfers or self.drop_slabs)
 
-    def _populate_drop_slabs(self, max_slab_idx: int) -> None:
-        """Populate drop_slabs by looking at the transfer plans"""
-        if max_slab_idx < 1:
-            return
-        maybe_drop_slabs = {
-            slab_idx
-            for tplan in self.transfers
-            if (slab_idx := tplan.src_slab_idx) is not None
-            and 0 < slab_idx <= max_slab_idx
-        }
-        if maybe_drop_slabs:
-            surviving_slabs = np.unique(self.slab_indices)
-            maybe_drop_slabs -= set(surviving_slabs.tolist())
-            self.drop_slabs.extend(sorted(maybe_drop_slabs))
-
     @property
     def head(self) -> str:
         """This is meant to be incorporated by the head() property of the subclasses"""
@@ -968,7 +978,7 @@ class SetItemPlan(MutatingPlan):
         **Implementation notes**
         There are three use cases to cover:
 
-        1. A chunk is full of fill_value or lays on a base slab,
+        1. A chunk is full of fill_value or lies on a base slab,
            and is only partially covered by the selection. We need a 4-pass process:
            a. create a new empty slab;
            b. transfer the chunk from the base or full slab to the new slab;
@@ -976,7 +986,7 @@ class SetItemPlan(MutatingPlan):
            d. potentially dereference the base slab if it contains no other chunks;
            e. update the new slab with the __setitem__ value.
 
-        2. A chunk is full of fill_value or lays on a base slab,
+        2. A chunk is full of fill_value or lies on a base slab,
            and is wholly covered by the selection:
            a. create a new empty slab;
            b. update the new slab with the __setitem__ value;
@@ -1000,7 +1010,7 @@ class SetItemPlan(MutatingPlan):
             return
 
         # Use case 1
-        # Find all chunks that are laying on a base or full slab and are only partially
+        # Find all chunks that lie on a base or full slab and are only partially
         # covered by the selection.
         partial_chunks = _chunks_in_selection(
             slab_indices,
@@ -1035,7 +1045,7 @@ class SetItemPlan(MutatingPlan):
 
         # Now all chunks are either on staged slabs or are wholly covered by the
         # selection. Effectively use case 1 has been simplified to use case 3: as long
-        # as a chunk already lays on a staged slab, we don't care if the selection is
+        # as a chunk already lies on a staged slab, we don't care if the selection is
         # whole or partial.
         setitem_chunks = _chunks_in_selection(
             slab_indices,
@@ -1048,7 +1058,7 @@ class SetItemPlan(MutatingPlan):
         # Break the above into use cases 2 and 3
         cut: ssize_t = int(np.searchsorted(setitem_chunks[:, ndim], n_base_slabs + 1))
         if cut > 0:
-            # Use case 2. These chunks lay on a read-only full or base slab, so we can't
+            # Use case 2. These chunks lie on a read-only full or base slab, so we can't
             # overwrite them with the __setitem__ value parameter.
 
             self.append_slabs.append((int(cut) * chunk_size[0],) + chunk_size[1:])
@@ -1077,8 +1087,9 @@ class SetItemPlan(MutatingPlan):
                 )
             )
 
-        if self.append_slabs:
-            self._populate_drop_slabs(max_slab_idx=n_base_slabs + 1)
+        # DO NOT perform a full scan of self.slab_indices in order to populate
+        # self.drop_slabs. Everything so far has been O(selected chunks), do not
+        # introduce an operation that is O(all chunks)!
 
     @property
     def head(self) -> str:
@@ -1280,8 +1291,6 @@ class ResizePlan(MutatingPlan):
         super().__init__(slab_indices, slab_offsets)
         if old_shape == new_shape:
             return
-        if n_slabs == 1:  # Only full slab. Can resize without any transfers.
-            return
 
         # Shrinking along an axis can't alter chunks on the slabs.
         # However, it can reduce the amount of chunks impacted by enlarges on other
@@ -1292,51 +1301,57 @@ class ResizePlan(MutatingPlan):
             chunks_slice = tuple(
                 slice(ceil_a_over_b(s, c)) for s, c in zip(shrunk_shape, chunk_size)
             )
-            # Just a view. This is OK as we're not going to modify contents.
+            # Just a view. This won't change the shape of the arrays when shrinking the
+            # edge chunks without reducing the number of chunks.
             self.slab_indices = self.slab_indices[chunks_slice]
             self.slab_offsets = self.slab_offsets[chunks_slice]
+        chunks_dropped = self.slab_indices.size < slab_indices.size
 
         if shrunk_shape != new_shape:
             # Enlarging along one or more axes. This is more involved than shrinking, as
             # we may need to potentially load and then update edge chunks.
 
-            # Deep-copy and (potentially) resize slab_indices and slab_offsets
+            # If we're actually adding chunks, and not just resizing the edge chunks,
+            # we need to enlarge slab_indices and slab_offsets too.
             pad_width = [
                 (0, ceil_a_over_b(s, c) - n)
                 for s, c, n in zip(new_shape, chunk_size, self.slab_indices.shape)
             ]
-            self.slab_indices = np.pad(self.slab_indices, pad_width)
-            self.slab_offsets = np.pad(self.slab_offsets, pad_width)
-            assert self.slab_indices.base is None  # deep-copied
+            # np.pad is a deep-copy; skip if unnecessary.
+            if any(p != (0, 0) for p in pad_width):
+                self.slab_indices = np.pad(self.slab_indices, pad_width)
+                self.slab_offsets = np.pad(self.slab_offsets, pad_width)
 
-            prev_shape = shrunk_shape
-            for axis, (prev_size, new_size) in enumerate(zip(prev_shape, new_shape)):
-                if prev_size == new_size:
-                    continue
+            # No need to transfer anything if there are only full chunks
+            if n_slabs > 1:
+                prev_shape = shrunk_shape
+                for axis in range(len(new_shape)):
+                    next_shape = new_shape[: axis + 1] + prev_shape[axis + 1 :]
+                    if next_shape != prev_shape:
+                        self._enlarge_along_axis(
+                            prev_shape,
+                            next_shape,
+                            chunk_size,
+                            axis,
+                            n_slabs + len(self.append_slabs),
+                            n_base_slabs,
+                        )
+                        prev_shape = next_shape
 
-                next_shape_l = list(prev_shape)
-                next_shape_l[axis] = new_size
-                next_shape = tuple(next_shape_l)
-
-                self._enlarge_along_axis(
-                    prev_shape,
-                    next_shape,
-                    chunk_size,
-                    axis,
-                    n_slabs + len(self.append_slabs),
-                    n_base_slabs,
-                )
-                prev_shape = next_shape
-            assert next_shape == new_shape
-
-        if shrunk_shape != old_shape:
-            # Shrinking may drop any slab. This is a fairly expensive search.
-            drop_slabs = np.setdiff1d(slab_indices, self.slab_indices)
-            drop_slabs = drop_slabs[drop_slabs != 0]
-            self.drop_slabs = drop_slabs.tolist()
-        elif self.append_slabs:
-            # Enlarging may only drop base slabs
-            self._populate_drop_slabs(max_slab_idx=n_base_slabs + 1)
+        # Shrinking may drop any slab. Crucially, they may be staged slabs, and
+        # dereferencing them means releasing memory.
+        # Enlarging may only drop base slabs. Let's not do that, for the same
+        # reason we don't do it in __setitem__: an all-too-common pattern is to
+        # enlarge over and over again by one or a few points.
+        if chunks_dropped:
+            # This may set to None again slabs that were already None. That's fine.
+            # On the upside, it also cleans up slabs dereferenced by __setitem__
+            # or by enlarge operations.
+            self.drop_slabs = np.setdiff1d(
+                np.arange(1, n_slabs, dtype=np_hsize_t),  # Never drop the full slab
+                np.unique(self.slab_indices),  # fairly expensive
+                assume_unique=True,
+            ).tolist()
 
     @cython.cfunc
     def _enlarge_along_axis(
@@ -1370,6 +1385,8 @@ class ResizePlan(MutatingPlan):
         if n_base_slabs > 0:
             idx = (slice(None),) * axis + (slice(old_floor_size, old_size),)
             _, mappers = index_chunk_mappers(idx, new_shape, chunk_size)
+            if not mappers:
+                return  # Resizing from size 0
 
             chunks = _chunks_in_selection(
                 self.slab_indices,
@@ -1395,6 +1412,8 @@ class ResizePlan(MutatingPlan):
         # Step 2
         idx = (slice(None),) * axis + (slice(old_size, new_size),)
         _, mappers = index_chunk_mappers(idx, new_shape, chunk_size)
+        if not mappers:
+            return  # Resizing from size 0
 
         chunks = _chunks_in_selection(
             self.slab_indices,
@@ -1502,7 +1521,9 @@ def _chunks_in_selection(
     (slice(0, 2, 1), slice(1, 5, 1))
     >>> tuple(m.whole_chunks_indexer() for m in mappers)
     (slice(1, 2, 1), slice(2, 4, 1))
-    >>> np.asarray(_chunks_in_selection(slab_indices, slab_offsets, mappers))
+    >>> np.asarray(_chunks_in_selection(
+    ...     slab_indices, slab_offsets, mappers, sort_by_slab=False
+    ... ))
     array([[ 0,  1,  0,  0],
            [ 0,  2,  1, 50],
            [ 0,  3,  2,  0],
@@ -1511,9 +1532,9 @@ def _chunks_in_selection(
            [ 1,  2,  0,  0],
            [ 1,  3,  0,  0],
            [ 1,  4,  1, 30]], dtype=uint64)
-    >>> np.asarray(
-    ...     _chunks_in_selection(slab_indices, slab_offsets, mappers, only_partial=True)
-    ... )
+    >>> np.asarray(_chunks_in_selection(
+    ...     slab_indices, slab_offsets, mappers, sort_by_slab=False, only_partial=True
+    ... ))
     array([[ 0,  1,  0,  0],
            [ 0,  2,  1, 50],
            [ 0,  3,  2,  0],
@@ -1544,6 +1565,7 @@ def _chunks_in_selection(
     axis: ssize_t
     mapper: IndexChunkMapper
     ndim = len(mappers)
+    assert ndim > 0
 
     indexers = tuple([mapper.chunks_indexer() for mapper in mappers])
 

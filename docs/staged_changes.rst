@@ -335,12 +335,13 @@ updates a chunk with ``__setitem__`` and later drops that very same chunk with
 workflow. Additionally, slabs are cleaned up as soon as the staged version is committed.
 
 If a slab is completely empty, however - in other words, it no longer appears in
-``slab_indices`` - it is dropped. The slab is replaced by None in the ``slabs`` list,
-which dereferences it. This allows not to change all the following slab indices after
-the operation. This happens for both the base slabs and the staged slabs, although
-nothing particular happens today when the ``raw_data`` base slab is deferenced by the
-``StagedChangesArray``, as it is still referenced by the ``InMemoryDataset``.
+``slab_indices`` - it *may* be dropped. This is guaranteed to happen for staged slabs
+and *may* happen for base slabs too (if computationally cheap to determine). Note that
+nothing particular happens today when the ``raw_data`` base slab, which is a hdf5
+dataset,is deferenced by the ``StagedChangesArray``.
 
+When a slab is dropped, it is replaced by None in the ``slabs`` list, which dereferences
+it. This allows not to change all the following slab indices after the operation.
 The full slab is never dropped, as it may be needed later by ``resize()`` to create new
 chunks or partially fill existing edge chunks.
 
