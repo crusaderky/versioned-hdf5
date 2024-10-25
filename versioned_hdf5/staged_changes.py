@@ -19,6 +19,7 @@ from numpy.typing import ArrayLike, DTypeLike, NDArray
 from .cytools import ceil_a_over_b, count2stop, np_hsize_t
 from .slicetools import read_many_slices
 from .subchunk_map import (
+    EntireChunksMapper,
     IndexChunkMapper,
     TransferType,
     index_chunk_mappers,
@@ -1017,10 +1018,7 @@ class SetItemPlan(MutatingPlan):
             slab_offsets,
             mappers,
             filter=lambda slab_idx: slab_idx <= n_base_slabs,
-            # We need to target the selection of whole_mappers below. idxidx=False of an
-            # arbitrary mapper allows you to select the points on the matching
-            # EverythingMappers.
-            idxidx=False,
+            idxidx=True,
             only_partial=True,
         )
         n_partial_chunks = partial_chunks.shape[0]
@@ -1031,10 +1029,12 @@ class SetItemPlan(MutatingPlan):
             self.append_slabs.append(
                 (n_partial_chunks * chunk_size[0],) + chunk_size[1:]
             )
-            _, whole_mappers = index_chunk_mappers((), shape, chunk_size)
+            entire_chunks_mappers: list[IndexChunkMapper] = [
+                EntireChunksMapper(mapper) for mapper in mappers
+            ]
             self.transfers.extend(
                 _make_transfer_plans(
-                    whole_mappers,
+                    entire_chunks_mappers,
                     partial_chunks,
                     src_slab_idx="chunks",
                     dst_slab_idx=n_slabs,
@@ -1519,8 +1519,8 @@ def _chunks_in_selection(
     ([0, 1], [1, 2, 3, 4])
     >>> tuple(m.chunks_indexer() for m in mappers)
     (slice(0, 2, 1), slice(1, 5, 1))
-    >>> tuple(m.whole_chunks_indexer() for m in mappers)
-    (slice(1, 2, 1), slice(2, 4, 1))
+    >>> tuple(m.whole_chunks_idxidx() for m in mappers)
+    (slice(1, 2, 1), slice(1, 3, 1))
     >>> np.asarray(_chunks_in_selection(
     ...     slab_indices, slab_offsets, mappers, sort_by_slab=False
     ... ))
@@ -1562,73 +1562,63 @@ def _chunks_in_selection(
                                            (1, 2) [0][ 0:]
                                            (1, 3) [1][30:]     (1, 3) [1][30:]
     """
-    axis: ssize_t
-    mapper: IndexChunkMapper
+    mapper: IndexChunkMapper  # noqa: F841
     ndim = len(mappers)
     assert ndim > 0
 
-    indexers = tuple([mapper.chunks_indexer() for mapper in mappers])
-
     if only_partial:
         # A partial chunk is a chunk that is selected by chunks_indexer() along all
-        # axes, but it is not selected by whole_chunks_indexer() along at least one axis
-        has_partial = False
-        whole_indexers = []
-        for mapper, idx in zip(mappers, indexers):
-            widx = mapper.whole_chunks_indexer()
-            whole_indexers.append(widx)
-            if not has_partial:
-                if isinstance(idx, slice):
-                    has_partial = not isinstance(widx, slice) or widx != idx
-                else:
-                    assert isinstance(idx, np.ndarray)
-                    # The two arrays are unique and sorted and widx is a subset of idx,
-                    # so testing the length is sufficient to determine equality
-                    has_partial = not isinstance(widx, np.ndarray) or len(widx) < len(
-                        idx
-                    )
+        # axes, but it is not selected by whole_chunks_idxidx() along at least one axis
+        any_partial = False
+        whole_chunks_idxidx = []
+        for mapper in mappers:
+            wcidx = mapper.whole_chunks_idxidx()
+            whole_chunks_idxidx.append(wcidx)
+            if not isinstance(wcidx, slice):
+                any_partial = True
+            elif wcidx != slice(0, len(mapper.chunk_indices), 1):
+                any_partial = True
 
-        if not has_partial:
+        if not any_partial:
             # All chunks are wholly selected
             return np.empty((0, ndim + 2), dtype=np_hsize_t)
 
-        # Chunks that are wholly selected along all axes
-        wholes = np.zeros_like(slab_indices)
-        for axis, widx in enumerate(whole_indexers):
-            widx_nd = (slice(None),) * axis + (widx,)
-            wholes[widx_nd] += 1
+    # Slice slab_indices and slab_offsets with mappers
+    indexers = ix_with_slices(
+        *[mapper.chunks_indexer() for mapper in mappers], shape=slab_indices.shape
+    )
+    slab_indices = slab_indices[indexers]
+    slab_offsets = slab_offsets[indexers]
 
-    # Slice chunk_states
-    indexers = ix_with_slices(*indexers, shape=slab_indices.shape)
+    if filter:
+        mask = filter(slab_indices)
+    else:
+        mask = np.broadcast_to(True, slab_indices.shape)
 
     if only_partial:
-        mask = partial_mask = wholes[indexers] < ndim
-    if filter:
-        mask = filter(slab_indices[indexers])
-    if only_partial and filter:
-        mask &= partial_mask
-    elif not only_partial and not filter:
-        mask = np.broadcast_to(True, slab_indices[indexers].shape)
+        whole_chunks_idxidx_tup = ix_with_slices(*whole_chunks_idxidx, shape=mask.shape)
+        if not filter:
+            mask = mask.copy()  # broadcasted
+        mask[whole_chunks_idxidx_tup] = False
 
+    # Apply mask and flatten
     nz = np.nonzero(mask)
-    chunk_indices = [
-        np.asarray(mapper.chunk_indices)[nz_i] for mapper, nz_i in zip(mappers, nz)
-    ]
-
-    filtered_slab_indices = slab_indices[tuple(chunk_indices)]
-    filtered_slab_offsets = slab_offsets[tuple(chunk_indices)]
+    slab_indices = slab_indices[nz]
+    slab_offsets = slab_offsets[nz]
 
     if idxidx:
         # Don't copy when converting from np.intp to uint64 on 64-bit platforms
-        ret_chunk_indices = [asarray(nz_i, np_hsize_t) for nz_i in nz]
+        columns = [asarray(nz_i, np_hsize_t) for nz_i in nz]
     else:
-        ret_chunk_indices = chunk_indices
-    columns = ret_chunk_indices + [filtered_slab_indices, filtered_slab_offsets]
+        columns = [
+            np.asarray(mapper.chunk_indices)[nz_i] for mapper, nz_i in zip(mappers, nz)
+        ]
+    columns += [slab_indices, slab_offsets]
 
-    stacked = np.empty((filtered_slab_indices.size, ndim + 2), dtype=np_hsize_t)
+    stacked = np.empty((slab_indices.size, ndim + 2), dtype=np_hsize_t)
 
     if sort_by_slab:
-        sort_idx = np.lexsort((filtered_slab_offsets, filtered_slab_indices))
+        sort_idx = np.lexsort((slab_offsets, slab_indices))
         for i, col in enumerate(columns):
             col.take(sort_idx, axis=0, out=stacked[:, i])
     else:

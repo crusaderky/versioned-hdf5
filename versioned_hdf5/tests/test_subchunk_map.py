@@ -14,7 +14,6 @@ from ..cytools import np_hsize_t
 from ..slicetools import read_many_slices
 from ..subchunk_map import (
     DROP_AXIS,
-    EverythingMapper,
     SliceMapper,
     TransferType,
     as_subchunk_map,
@@ -135,7 +134,7 @@ def test_as_subchunk_map(args):
 @given(idx_shape_chunks_st(max_ndim=1))
 @hypothesis.settings(max_examples=max_examples, deadline=None)
 def test_chunks_indexer(args):
-    """Test IndexChunkMapper.chunks_indexer and IndexChunkMapper.whole_chunks_indexer"""
+    """Test IndexChunkMapper.chunks_indexer and IndexChunkMapper.whole_chunks_idxidx"""
     idx, shape, chunks = args
     _, mappers = index_chunk_mappers(idx, shape, chunks)
     if not mappers:
@@ -152,7 +151,7 @@ def test_chunks_indexer(args):
 
     all_chunks = np.arange(mapper.n_chunks)
     sel_chunks = all_chunks[mapper.chunks_indexer()]
-    whole_chunks = all_chunks[mapper.whole_chunks_indexer()]
+    whole_chunks = sel_chunks[mapper.whole_chunks_idxidx()]
 
     # Test that the slices of chunks are strictly monotonic ascending
     assert_array_equal(sel_chunks, np.unique(sel_chunks))
@@ -418,26 +417,9 @@ def test_mapper_attributes():
 
 
 def test_simplify_indices():
-    """Test that
-
-    - a slice or a fancy index that selects everything results in an EverythingMapper
-    - a fancy index that can be redefined globally as a slice results in a SliceMapper
+    """Test that a fancy index that can be redefined globally as a slice results
+    in a SliceMapper
     """
-    _, (mapper,) = index_chunk_mappers((), (4,), (2,))
-    assert isinstance(mapper, EverythingMapper)
-
-    _, (mapper,) = index_chunk_mappers(slice(None), (4,), (2,))
-    assert isinstance(mapper, EverythingMapper)
-
-    _, (mapper,) = index_chunk_mappers(slice(999), (4,), (2,))
-    assert isinstance(mapper, EverythingMapper)
-
-    _, (mapper,) = index_chunk_mappers([True, True, True, True], (4,), (2,))
-    assert isinstance(mapper, EverythingMapper)
-
-    _, (mapper,) = index_chunk_mappers([0, 1, 2, 3], (4,), (2,))
-    assert isinstance(mapper, EverythingMapper)
-
     _, (mapper,) = index_chunk_mappers([True, True, False, False], (4,), (2,))
     assert isinstance(mapper, SliceMapper)
     assert mapper.start == 0
@@ -485,13 +467,13 @@ def test_chunks_indexer_simplifies_indices():
         [True, False, True, True, False, False], (6,), (2,)
     )
     assert mapper.chunks_indexer() == slice(0, 2, 1)
-    assert mapper.whole_chunks_indexer() == slice(1, 2, 1)
+    assert mapper.whole_chunks_idxidx() == slice(1, 2, 1)
 
     _, (mapper,) = index_chunk_mappers(
         [True, False, True, True, False, False, True, True, True, True], (10,), (2,)
     )
     assert_array_equal(mapper.chunks_indexer(), [0, 1, 3, 4])
-    assert_array_equal(mapper.whole_chunks_indexer(), [1, 3, 4])
+    assert_array_equal(mapper.whole_chunks_idxidx(), slice(1, 4, 1))
 
     _, (mapper,) = index_chunk_mappers(
         [True, False, False, True, True, False],
@@ -499,4 +481,4 @@ def test_chunks_indexer_simplifies_indices():
         (2,),
     )
     assert mapper.chunks_indexer() == slice(0, 3, 1)
-    assert mapper.whole_chunks_indexer() == slice(0, 0, 1)
+    assert mapper.whole_chunks_idxidx() == slice(0, 0, 1)

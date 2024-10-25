@@ -369,7 +369,7 @@ def test_big_O_performance():
     """
 
     def benchmark(shape):
-        arr = StagedChangesArray.full(shape, (1, 1))
+        arr = StagedChangesArray.full(shape, (1, 2))
         # Don't measure page faults on first access to slab_indices and slab_offsets.
         # In the 10 chunks use case, it's almost certainly reused memory.
         _ = arr[0, -3:]
@@ -377,28 +377,47 @@ def test_big_O_performance():
         t0 = time.thread_time()
         # Let's access the end, just in case there's something that
         # performs a full scan which stops when the selection ends.
+
+        # Update only part of a chunk. This triggers a whole
+        # extra section worth of logic in __setitem__.
         arr[0, -1] = 42
         assert arr[0, -1] == 42
         assert arr[0, -2] == 0
+        # arr.resize((shape[0], shape[1] - 1))
+        # arr.resize(shape)
         t1 = time.thread_time()
         return t1 - t0
 
-    # trivially sized baseline: 10 chunks
+    # trivially sized baseline: 5 chunks
     a = benchmark((1, 10))
 
-    # 10 million chunks, small rulers
+    # 5 million chunks, small rulers
     # Test will trip if __getitem__ or __setitem__ perform a
     # full scan of slab_indices and/or slab_offsets anywhere
     b = benchmark((2_500, 4_000))
     np.testing.assert_allclose(b, a, rtol=0.2)
 
-    # 10 million chunks, long rulers
+    # 5 million chunks, long rulers
     # Test will trip if __getitem__ or __setitem__ construct or iterate upon a ruler as
     # long as the number of chunks along one axis, e.g. np.arange(mapper.n_chunks)
     c = benchmark((1, 10_000_000))
     np.testing.assert_allclose(c, a, rtol=0.2)
 
 
-# TODO weird dtypes
-# TODO __repr__
-# TODO invalid parameters
+def test_dont_load_wholly_selected_chunks():
+    """Test that __setitem__ loads from the base slabs only the chunks that are
+    partially selected by the index
+    """
+    raise NotImplementedError("TODO")
+
+
+def test_weird_dtypes():
+    raise NotImplementedError("TODO")
+
+
+def test_repr():
+    raise NotImplementedError("TODO")
+
+
+def test_invalid_parameters():
+    raise NotImplementedError("TODO")

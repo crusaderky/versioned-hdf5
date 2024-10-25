@@ -241,15 +241,22 @@ class IndexChunkMapper:
 
     @cython.ccall
     @abc.abstractmethod
-    def whole_chunks_indexer(self):  # -> slice | NDArray[np_hsize_t]:
-        """Return a subset of chunks_indexer that selects only the chunks where all
-        points of the chunk are included in the selection.
+    def whole_chunks_idxidx(self):  # -> slice | NDArray[np.intp]:
+        """Return an index that further refines the output of chunks_indexer and
+        selects only the chunks where all points of the chunk are included in the
+        selection.
 
-        e.g. if the index of this mapper is [True, True, False, False, True, False]
+        e.g. if the index of this mapper is [True, False, False, False, True, True]
         and self.chunk_size=2, then:
 
-        - self.chunks_indexer -> [0, 2]
-        - self.whole_chunks_indexer -> [0]
+        - self.chunks_indexer() -> [0, 2]
+        - self.whole_chunks_idxidx() -> [1]  # relative to the output of chunks_indexer
+
+        In other words:
+
+        >> all_chunk_indices = np.arange(self.n_chunks)
+        >> selected_chunk_indices = all_chunk_indices[self.chunks_indexer()]
+        >> whole_chunk_indices = selected_chunk_indices[self.whole_chunks_idxidx()]
         """
 
     @property
@@ -421,38 +428,31 @@ class SliceMapper(BasicChunkMapper):
             return slice(int(chunk_start), int(chunk_stop), 1)
 
     @cython.ccall
-    def whole_chunks_indexer(self):  # -> slice | NDArray[np_hsize_t]:
-        if self.chunk_size == 1:
-            # All chunks are wholly selected
-            return self.chunks_indexer()
-
+    def whole_chunks_idxidx(self):
         indices = self.chunk_indices
         idx_len = len(indices)
         assert idx_len > 0  # Empty slices are filtered out by index_chunk_mappers()
-        last_idx = indices[idx_len - 1]
+
+        if self.chunk_size == 1:
+            # All chunks are wholly selected
+            return slice(0, idx_len, 1)
 
         if self.step > 1:
-            if self.last_chunk_size == 1 and last_idx == self.n_chunks - 1:
+            if self.last_chunk_size == 1 and indices[idx_len - 1] == self.n_chunks - 1:
                 # Last chunk contains exactly one point, so it's wholly covered.
                 # For all other chunks, chunk_size > 1 and step > 1 so the selection
                 # will never cover a whole chunk
-                return slice(int(last_idx), self.n_chunks, 1)
+                return slice(idx_len - 1, idx_len, 1)
             else:
                 return slice(0, 0, 1)
 
         # step==1. The first and last chunk may be partially selected;
         # the rest are always wholly selected.
-        chunk_start = indices[0]
-        if self.start % self.chunk_size != 0:
-            # First chunk is partially selected
-            chunk_start += 1
-
-        chunk_stop = last_idx  # excluded
-        if self.stop == self.dset_size or self.stop % self.chunk_size == 0:
-            # Last chunk is wholly selected
-            chunk_stop += 1
-
-        return slice(int(chunk_start), int(chunk_stop), 1)
+        idxidx_start = int(self.start % self.chunk_size != 0)
+        idxidx_stop = idx_len
+        if self.stop < self.dset_size and self.stop % self.chunk_size > 0:
+            idxidx_stop -= 1
+        return slice(idxidx_start, idxidx_stop, 1)
 
 
 @cython.cclass
@@ -497,9 +497,9 @@ class IntegerMapper(BasicChunkMapper):
         return slice(i, i + 1, 1)
 
     @cython.ccall
-    def whole_chunks_indexer(self):
+    def whole_chunks_idxidx(self):
         if self.chunk_size == 1:
-            return self.chunks_indexer()
+            return slice(0, 1, 1)
 
         # If the index is in the last chunk and the last chunk is size 1, then it's
         # wholly selected. In any other case, it's partially selected.
@@ -508,7 +508,7 @@ class IntegerMapper(BasicChunkMapper):
             return slice(0, 0, 1)
         if self.chunk_indices[0] != self.dset_size // self.chunk_size:
             return slice(0, 0, 1)
-        return self.chunks_indexer()
+        return slice(0, 1, 1)
 
     @property
     def value_view_idx(self) -> slice | None:
@@ -516,24 +516,25 @@ class IntegerMapper(BasicChunkMapper):
 
 
 @cython.cclass
-class EverythingMapper(BasicChunkMapper):
-    """Select all points along an axis [:].
+class EntireChunksMapper(BasicChunkMapper):
+    """Special mapper that selects all points on the chunks selected by another mapper.
 
-    This is functionally identical to SliceMapper(slice(None), chunk_size, dset_size),
-    special-cased here for simplicity and speed.
+    This is used to load the entire chunk for the purpose of caching when the
+    actual selection may only target part of it.
     """
 
-    def __init__(self, dset_size: hsize_t, chunk_size: hsize_t):
-        n_chunks = ceil_a_over_b(dset_size, chunk_size)
-        super().__init__(np.arange(n_chunks, dtype=np_hsize_t), dset_size, chunk_size)
+    _chunks_indexer: slice | NDArray[np.intp]
+
+    def __init__(self, other: IndexChunkMapper):
+        self._chunks_indexer = other.chunks_indexer()
+        super().__init__(other.chunk_indices, other.dset_size, other.chunk_size)
 
     @cython.ccall
-    def chunk_submap(self, chunk_idx: hsize_t) -> tuple[Slice, slice, slice]:
-        chunk_start, chunk_stop = self._chunk_start_stop(chunk_idx)
-        return (
-            Slice(chunk_start, chunk_stop, 1),
-            slice(chunk_start, chunk_stop, 1),
-            slice(0, chunk_stop - chunk_start, 1),
+    def chunk_submap(
+        self, chunk_idx: hsize_t
+    ) -> tuple[Slice, AnySlicer | DropAxis, AnySlicer]:
+        raise NotImplementedError(  # pragma: nocover
+            "not used in legacy as_subchunk_map"
         )
 
     @cython.cfunc
@@ -553,11 +554,11 @@ class EverythingMapper(BasicChunkMapper):
 
     @cython.ccall
     def chunks_indexer(self):
-        return slice(0, self.n_chunks, 1)
+        return self._chunks_indexer
 
     @cython.ccall
-    def whole_chunks_indexer(self):
-        return slice(0, self.n_chunks, 1)
+    def whole_chunks_idxidx(self):
+        return slice(0, len(self.chunk_indices), 1)
 
 
 @cython.cclass
@@ -720,13 +721,11 @@ class IntegerArrayMapper(IndexChunkMapper):
         return _maybe_array_idx_to_slice(indices)
 
     @cython.ccall
-    def whole_chunks_indexer(self):
+    def whole_chunks_idxidx(self):
         # Don't double count when the same index is picked twice
         idx_unique = np.unique(self.idx)
         _, counts = np.unique(idx_unique // self.chunk_size, return_counts=True)
-        indices = np.asarray(self.chunk_indices)
-        indices = indices[counts == self._chunk_sizes_in_chunk_indices()]
-        return _maybe_array_idx_to_slice(indices)
+        return _maybe_array_idx_to_slice(counts == self._chunk_sizes_in_chunk_indices())
 
 
 @cython.cfunc
@@ -868,7 +867,7 @@ def index_chunk_mappers(
     # Handle the remaining suffix axes on which we did not select, we still need to
     # break them up into chunks.
     for d, n in zip(shape[idx_len:], chunk_size[idx_len:]):
-        mappers.append(EverythingMapper(d, n))
+        mappers.append(SliceMapper(slice(0, d, 1), d, n))
 
     return idx, mappers
 
@@ -887,10 +886,7 @@ def _index_to_mapper(idx, dset_size: hsize_t, chunk_size: hsize_t) -> IndexChunk
             return IntegerArrayMapper(idx, dset_size, chunk_size)
 
     if isinstance(idx, slice):
-        if idx == slice(0, dset_size, 1):
-            return EverythingMapper(dset_size, chunk_size)
-        else:
-            return SliceMapper(idx, dset_size, chunk_size)
+        return SliceMapper(idx, dset_size, chunk_size)
 
     raise NotImplementedError(f"index type {type(idx)} not supported")
 

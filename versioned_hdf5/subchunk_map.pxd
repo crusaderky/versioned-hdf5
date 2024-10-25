@@ -14,7 +14,7 @@ cdef class IndexChunkMapper:
     cpdef tuple[object, object | None] read_many_slices_params(self)
 
     cpdef object chunks_indexer(self)
-    cpdef object whole_chunks_indexer(self)
+    cpdef object whole_chunks_idxidx(self)
 
     # Private methods. Cython complains if we don't export _everything_.
     cdef tuple[hsize_t, hsize_t] _chunk_start_stop(
