@@ -61,6 +61,8 @@ class DropAxis(enum.Enum):
 DROP_AXIS = DropAxis._drop_axis
 
 
+# This is an abstract class, which should inherit from abc.ABC
+# or have metaclass=abc.ABCMeta. Neither are supported by Cython though.
 @cython.cclass
 class IndexChunkMapper:
     """Abstract class that manipulates a numpy fancy index along a single axis of a
