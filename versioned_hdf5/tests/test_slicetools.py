@@ -488,11 +488,11 @@ def test_read_many_slices_fail():
         read_many_slices(np.array(0), np.array(0), [[]], [[]], [[]])
 
     # src.ndim != dst.ndim
-    with pytest.raises(ValueError, match="same dtype and dimensionality"):
+    with pytest.raises(ValueError, match="dimensionality mismatch"):
         read_many_slices(src.reshape(2, 2), dst, [[0]], [[0]], [[1]])
 
     # src.dtype != dst.dtype
-    with pytest.raises(ValueError, match="same dtype and dimensionality"):
+    with pytest.raises(ValueError, match="dtype mismatch"):
         read_many_slices(src.astype(float), dst, [[0]], [[0]], [[1]])
 
     # Fail to broadcast coordinates
