@@ -64,6 +64,16 @@ cython_args = [
 # (read: https://cython.readthedocs.io/en/latest/src/tutorial/pure.html)
 run_command('cp', 'cytools.py', 'cytools.pyx')
 py.extension_module(
+    'hashing',
+    'hashing.pyx',
+    install: true,
+    subdir: 'versioned_hdf5',
+    dependencies: compiled_deps,
+    cython_args: cython_args,
+    include_directories: [npy_include_path],
+)
+
+py.extension_module(
     'cytools',
     'cytools.pyx',
     install: true,
