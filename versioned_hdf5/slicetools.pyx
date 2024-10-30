@@ -46,6 +46,15 @@ cdef extern from "hdf5.h":
         void* buf,
     ) nogil
 
+    cdef herr_t H5Dwrite(
+        hid_t dset_id,
+        hid_t mem_type_id,
+        hid_t mem_space_id,
+        hid_t file_space_id,
+        hid_t dxpl_id,
+        void* buf,
+    ) nogil
+
     cdef hid_t H5E_DEFAULT = 0
     cdef herr_t H5Eprint(hid_t stack_id, FILE* stream) nogil
 
@@ -282,9 +291,12 @@ cdef Exception HDF5Error():
     return RuntimeError(msg)
 
 
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.infer_types(True)
 cpdef void read_many_slices(
-    src: np.ndarray | h5py.Dataset,
-    np.ndarray dst,
+    src,  # any numpy array-like
+    dst,  # any numpy array-like
     src_start: ArrayLike,
     dst_start: ArrayLike,
     count: ArrayLike,
@@ -302,11 +314,19 @@ cpdef void read_many_slices(
 
     Parameters
     ----------
-    src: np.ndarray | h5py.Dataset
+    src: np.ndarray | h5py.Dataset | other numpy-like object
         The source data to read from
-    dst: np.ndarray
+    dst: np.ndarray | h5py.Dataset | other numpy-like object
         The destination array to write to.
-        It must be C-contiguous and of the same dtype and dimensionality as src.
+
+        The following combinations of src and dst are optimized:
+
+        - src is a h5py.Dataset with simple extents; dst is a C-contiguous numpy array
+        - dst is a h5py.Dataset with simple extents; src is a C-contiguous numpy array
+
+        All other combinations are supported but fall back to a generic, pure-python
+        transfer.
+
     src_start: array-like
         The starting coordinates, a.k.a. offsets, of the slices in src.
         It must be a 2D array or array-like (e.g. list of lists) with the same number of
@@ -325,9 +345,13 @@ cpdef void read_many_slices(
         The stride of the slices when writing to dst.
         Same format as src_start. If omitted, default to 1.
     fast: bool, optional
-        If True, use the hdf5 C API directly to read the data if possible. This is when
-        src is a h5py dataset with a simple data type (see h5py.Dataset._fast_read_ok).
-        If False, use pure Python numpy syntax to slice src and dst.
+        If True, use the hdf5 C API directly to transfer the data. This is possible when
+        src is a h5py dataset with a simple data type (see h5py.Dataset._fast_read_ok)
+        and dst is a C-contiguous numpy array, or vice versa.
+        Raise if fast transfer is not possible.
+
+        If False, always use pure Python numpy syntax to slice src and dst.
+
         If omitted, determine automatically. It's recommended to omit this flag unless
         you're running a unit test or benchmark.
 
@@ -376,16 +400,16 @@ cpdef void read_many_slices(
 
     Performance notes
     -----------------
-    When reading from h5py, this function calls::
+    When reading between a h5py and a C-contiguous numpy array, this function calls::
 
         H5Sselect_hyperslab(file_id, H5S_SELECT_SET, ...)
         H5Sselect_hyperslab(mem_id, H5S_SELECT_SET, ...)
-        H5DRead(...)
+        H5Dread(...) / H5Dwrite(...)
 
-    once per input row; see _read_many_slices_fast.
+    once per input row; see _read_many_slices_h5_to_np and _read_many_slices_np_to_h5.
 
     This is much faster than calling H5Sselect_hyperslab(..., H5S_SELECT_OR, ...) once
-    per input row followed by a single call to H5DRead, a.k.a. hyperslab fusion,
+    per input row followed by a single call to H5Dread, a.k.a. hyperslab fusion,
     due to a known issue in libhdf5:
     https://forum.hdfgroup.org/t/union-of-non-consecutive-hyperslabs-is-very-slow/5062
 
@@ -396,42 +420,40 @@ cpdef void read_many_slices(
     """
     # Begin input validation and preprocessing
 
-    ndim = dst.ndim
+    cdef int ndim = src.ndim
     if ndim < 1:
         raise ValueError("must operate on at least one dimension")
-    if dst.dtype != src.dtype or ndim != src.ndim or not dst.flags.writeable:
-        raise ValueError(
-            "dst must be a writeable numpy array of the same dtype and dimensionality "
-            "as src"
-        )
-    if dst.size == 0 or not all(src.shape):
+    if dst.dtype != src.dtype:
+        raise ValueError(f"dtype mismatch: {src.dtype=} != {dst.dtype=}")
+    if dst.ndim != ndim:
+        raise ValueError(f"dimensionality mismatch: {src.ndim=} != {dst.ndim}")
+    if isinstance(dst, np.ndarray) and not dst.flags.writeable:
+        raise ValueError("dst must be writeable")
+
+    if dst.size == 0 or src.size == 0:
         return
 
-    cdef bint bfast = False
+    cdef bint fast_h5_to_np = False
+    cdef bint fast_np_to_h5 = False
     if fast is not False:
-        if isinstance(src, h5py.Dataset):
-            with phil:
-                bfast = src._fast_read_ok
-        if fast and not bfast:
-            raise ValueError("fast transfer is not possible with this source")
+        fast_h5_to_np = _supports_fast_h5_np(src, dst)
+        fast_np_to_h5 = _supports_fast_h5_np(dst, src)
+        if fast is True and not fast_h5_to_np and not fast_np_to_h5:
+            raise ValueError("fast transfer is not possible with given src/dst arrays")
+    cdef bint contiguous_columns = fast_h5_to_np or fast_np_to_h5
 
-    if bfast and not dst.flags.c_contiguous:
-        # TODO we could support non-C-contiguous arrays by doing
-        # arithmetics with starts and strides
-        raise NotImplementedError("dst must be C-contiguous for fast mode")
-
-    src_start = _preproc_many_slices_idx(src_start, ndim, bfast)
-    dst_start = _preproc_many_slices_idx(dst_start, ndim, bfast)
-    count = _preproc_many_slices_idx(count, ndim, bfast)
+    src_start = _preproc_many_slices_idx(src_start, ndim, contiguous_columns)
+    dst_start = _preproc_many_slices_idx(dst_start, ndim, contiguous_columns)
+    count = _preproc_many_slices_idx(count, ndim, contiguous_columns)
 
     if src_stride is None:
         src_stride = np.ones(ndim, dtype=np_hsize_t)
     else:
-        src_stride = _preproc_many_slices_idx(src_stride, ndim, bfast)
+        src_stride = _preproc_many_slices_idx(src_stride, ndim, contiguous_columns)
     if dst_stride is None:
         dst_stride = np.ones(ndim, dtype=np_hsize_t)
     else:
-        dst_stride = _preproc_many_slices_idx(dst_stride, ndim, bfast)
+        dst_stride = _preproc_many_slices_idx(dst_stride, ndim, contiguous_columns)
 
     for arr in (src_start, dst_start, count, src_stride, dst_stride):
         if arr.size == 0:
@@ -449,14 +471,11 @@ cpdef void read_many_slices(
     if src_start.shape[1] != ndim:
         raise ValueError("Coordinates arrays must have as many columns as src.ndim")
 
-    cdef np.ndarray src_shape = np.array(src.shape, dtype=np_hsize_t)
-    cdef np.npy_intp[1] ndim_ptr = {ndim}
-    cdef np.ndarray dst_shape = np.PyArray_SimpleNewFromData(
-        1, ndim_ptr, np.NPY_INTP, <void*>dst.shape
-    )
-    # On 32-bit platforms, sizeof(hsize_t) == 8; sizeof(npy_intp) == 4
-    # On 64-bit platforms, don't copy unnecessarily
-    dst_shape = asarray(dst_shape, np_hsize_t)
+    cdef hsize_t[NPY_MAXDIMS] src_shape
+    cdef hsize_t[NPY_MAXDIMS] dst_shape
+    for i in range(ndim):
+        src_shape[i] = src.shape[i]
+        dst_shape[i] = dst.shape[i]
 
     clipped_count = _clip_count(
         src_shape,
@@ -470,11 +489,24 @@ cpdef void read_many_slices(
 
     # End of input validation and preprocessing
 
-    if bfast:
-        _read_many_slices_fast(
+    if fast_h5_to_np:
+        _read_many_slices_h5_np(
             src,
             dst,
-            <hsize_t*>dst_shape.data,
+            False,
+            dst_shape,
+            src_start,
+            dst_start,
+            clipped_count,
+            src_stride,
+            dst_stride,
+        )
+    elif fast_np_to_h5:
+        _read_many_slices_h5_np(
+            dst,
+            src,
+            True,
+            src_shape,
             src_start,
             dst_start,
             clipped_count,
@@ -482,7 +514,7 @@ cpdef void read_many_slices(
             dst_stride,
         )
     else:
-        _read_many_slices_slow(
+        _read_many_slices_generic(
             src,
             dst,
             src_start,
@@ -493,7 +525,9 @@ cpdef void read_many_slices(
         )
 
 
-cdef np.ndarray _preproc_many_slices_idx(obj: ArrayLike, hsize_t ndim, bint fast):
+cdef np.ndarray _preproc_many_slices_idx(
+    obj: ArrayLike, hsize_t ndim, bint contiguous_columns
+):
     """Helper of read_many_slices. Ensure that obj is a numpy array of hsize_t with
     either 1 or 2 dimensions, and that it's C-contiguous at least along the
     innermost dimension.
@@ -516,7 +550,7 @@ cdef np.ndarray _preproc_many_slices_idx(obj: ArrayLike, hsize_t ndim, bint fast
     # H5Sselect_hyperslab. So a view like a[:2] is OK, but a[::2] must be made
     # contiguous first. Note that, to save a bit of time, this deep-copy happens before
     # we broadcast 1D arrays to add rows.
-    if fast and arr.strides[arr.ndim - 1] != sizeof(hsize_t):
+    if contiguous_columns and arr.strides[arr.ndim - 1] != sizeof(hsize_t):
         return np.ascontiguousarray(arr)
     else:
         return arr
@@ -559,45 +593,73 @@ cdef hsize_t[:, :] _clip_count(
     return out
 
 
+cdef bint _supports_fast_h5_np(maybe_h5_arr, maybe_np_arr):
+    """Return True if we can use _read_many_slices_h5_np; False otherwise.
+    """
+    if not isinstance(maybe_h5_arr, h5py.Dataset):
+        return False
+    if not isinstance(maybe_np_arr, np.ndarray):
+        return False
+    with phil:
+        if not maybe_h5_arr._fast_read_ok:
+            return False
+    if not maybe_np_arr.flags.c_contiguous:
+        # For the xake of user awareness, fail when the fast parameter is omitted
+        raise NotImplementedError(
+            "non-contiguous array in fast mode; force fast=False to continue"
+        )
+    return True
+
+
 @cython.wraparound(False)
 @cython.boundscheck(False)
 @cython.infer_types(True)
-cdef void _read_many_slices_fast (
-    src: h5py.Dataset,
-    np.ndarray dst,
-    const hsize_t* dst_shape,
+cdef void _read_many_slices_h5_np (
+    h5_dset: h5py.Dataset,
+    np.ndarray np_arr,
+    bint write,
+    const hsize_t* np_arr_shape,
     const hsize_t[:, :] src_start,
     const hsize_t[:, :] dst_start,
     const hsize_t[:, :] count,
     const hsize_t[:, :] src_stride,
     const hsize_t[:, :] dst_stride,
 ):
-    """Implements read_many_slices data transfer when src is a h5py.Dataset with simple
-    extents only (h5py.Dataset._fast_read_ok).
+    """Implements read_many_slices data transfer between an h5py.Dataset with simple
+    extents (h5py.Dataset._fast_read_ok) and a C-contiguous numpy array.
 
     Performance notes
     -----------------
     See docstring of read_many_slices
     """
-    nslices, ndim = src_start.shape[:2]
-
     with phil:
         # h5py internals. See h5py/dataset.py and h5py/_selector.pyx.
-        dset_id: hid_t = src.id.id
+        dset_id: hid_t = h5_dset.id.id
         # must remain in scope for the id to remain valid
-        space = src.id.get_space()
+        space = h5_dset.id.get_space()
         file_space_id: hid_t = space.id
         # must remain in scope for the id to remain valid
-        mem_type = py_create(src.dtype)
+        mem_type = py_create(h5_dset.dtype)
         mem_type_id: hid_t = mem_type.id
 
         # libhdf5 is not thread safe (read comment about locking in h5py/_objects.pyx),
         # so we are wrapping everything in a reentrant lock (`with phil`).
         # We can however release the GIL to allow unrelated code to run in parallel.
         with nogil:
-            mem_space_id = H5Screate_simple(ndim, dst_shape, NULL)
+            nslices, ndim = src_start.shape[:2]
+
+            mem_space_id = H5Screate_simple(ndim, np_arr_shape, NULL)
             if mem_space_id == H5I_INVALID_HID:
                 raise HDF5Error()
+
+            if write:
+                src_space_id = mem_space_id
+                dst_space_id = file_space_id
+                write_func = H5Dwrite
+            else:
+                src_space_id = file_space_id
+                dst_space_id = mem_space_id
+                write_func = H5Dread
 
             try:
                 for i in range(nslices):
@@ -607,7 +669,7 @@ cdef void _read_many_slices_fast (
                     else:
                         # count > 0 along all axes
                         if H5Sselect_hyperslab(
-                            file_space_id,
+                            src_space_id,
                             H5S_SELECT_SET,
                             &src_start[i, 0],
                             &src_stride[i, 0],
@@ -617,7 +679,7 @@ cdef void _read_many_slices_fast (
                             raise HDF5Error()
 
                         if H5Sselect_hyperslab(
-                            mem_space_id,
+                            dst_space_id,
                             H5S_SELECT_SET,
                             &dst_start[i, 0],
                             &dst_stride[i, 0],
@@ -626,15 +688,16 @@ cdef void _read_many_slices_fast (
                         ) < 0:
                             raise HDF5Error()
 
-                        if H5Dread(
+                        if write_func(
                             dset_id,
                             mem_type_id,
                             mem_space_id,
                             file_space_id,
                             H5P_DEFAULT,
-                            dst.data,
+                            np_arr.data,
                         ) < 0:
                             raise HDF5Error()
+
             finally:
                 if H5Sclose(mem_space_id) < 0:
                     raise HDF5Error()
@@ -643,27 +706,31 @@ cdef void _read_many_slices_fast (
 @cython.wraparound(False)
 @cython.boundscheck(False)
 @cython.infer_types(True)
-cdef void _read_many_slices_slow (
-    src: np.ndarray | h5py.Dataset,
-    np.ndarray dst,
+cdef void _read_many_slices_generic (
+    src,  # Any numpy-like object
+    dst,  # Any numpy-like object
     const hsize_t[:, :] src_start,
     const hsize_t[:, :] dst_start,
     const hsize_t[:, :] count,
     const hsize_t[:, :] src_stride,
     const hsize_t[:, :] dst_stride,
 ):
-    """Implements read_many_slices data transfer when fast transfer cannot be performed.
+    """Implements read_many_slices data transfer between two arbitrary Python objects
+    that support a basic numpy-array-like duck-type API.
 
     This happens when:
-    1. src is a h5py.Dataset but h5py.Dataset._fast_read_ok returns False.
-       This is to avoid replicating the complex machinery found in
-       h5py.Dataset.__getitem__.
-    2. src is a numpy array.
+    - src or dst is a h5py.Dataset but h5py.Dataset._fast_read_ok returns False.
+      This is to avoid replicating the complex machinery found in
+      h5py.Dataset.__getitem__/__setitem__;
+    - src or dst are non-contiguous numpy array;
+    - both src and dst are numpy arrays;
+    - either src and dst are arbitrary numpy-like objects (neither numpy nor h5py).
 
     Performance notes
     -----------------
-    There has been experimentation to bypass the Python slicing machinery by hacking the
-    numpy C API. While functionally successful, there was no material performance gain.
+    There has been experimentation to bypass the Python slicing machinery to implement
+    numpy-to-numpy transfers by hacking the numpy C API.
+    While functionally successful, there was no material performance gain.
 
     An alternative approach would be to manually loop over the strides at least for
     basic item sizes (1, 2, 4, and 8 bytes). This has not been attempted yet.
