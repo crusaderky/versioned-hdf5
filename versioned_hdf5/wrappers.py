@@ -595,13 +595,12 @@ class InMemoryDataset(Dataset):
     in-memory only.
     """
 
-    def __init__(self, bind, parent, **kwargs):
+    def __init__(self, bind, parent, *, readonly=False):
         # Hold a reference to the original bind so h5py doesn't invalidate the id
         # XXX: We need to handle deallocation here properly when our object
         # gets deleted or closed.
         self.orig_bind = bind
-        super().__init__(InMemoryDatasetID(bind.id), **kwargs)
-        self._init_kwargs = kwargs
+        super().__init__(InMemoryDatasetID(bind.id), readonly=readonly)
         self._parent = parent
         self._attrs = dict(super().attrs)
 
@@ -656,29 +655,32 @@ class InMemoryDataset(Dataset):
     def compression_opts(self, value):
         self.parent.set_compression_opts(self.name, value)
 
-    def as_dtype(self, name, dtype, parent, casting="unsafe"):
+    def astype(self, dtype, casting="unsafe"):
+        """Overwrite `self` in place, changing the dtype.
+
+        This is exclusively possible when converting between NumPy dtypes that are
+        identical once stored on HDF5, such as StringDType ('T')
+        and object strings ('O') (requires h5py >=3.14 and NumPy >=2.0).
+
+        `casting` should be as in the NumPy astype() method.
         """
-        Return a copy of `self` as a new dataset with the given `name` and `dtype`
-        in the group `parent`.
+        # In most cases, the new raw_data is a read-only AsTypeView object.
+        # However, if the new dtype is 'T' (StringDType), thew new raw_data will be a
+        # writeable h5py.Dataset object instead (requires h5py >=3.14 and NumPy >=2.0).
+        raw_data = self.id.raw_data.astype(dtype)
+        if not isinstance(raw_data, Dataset):  # read-only AsTypeView
+            raise ValueError("Cannot change dtype in place")
+        new_base_dataset = super().parent[super().name].astype(dtype)
+        assert type(new_base_dataset) is Dataset
 
-        `casting` should be as in the numpy astype() method.
-
-        """
-        fillvalue = super().fillvalue
-        init_kwargs = self._init_kwargs.copy()
-        if fillvalue is not None:
-            fillvalue = fillvalue.astype(dtype, casting=casting)
-            init_kwargs.setdefault("fillvalue", fillvalue)
-
-        new_dataset = InMemoryDataset(
-            bind=self.orig_bind,
-            parent=parent,
-            **init_kwargs,
+        new_im_dataset = InMemoryDataset(
+            bind=new_base_dataset.id, parent=self.parent, readonly=self._readonly
         )
-
-        new_dataset.staged_changes = self.staged_changes.astype(dtype, casting=casting)
-        parent[name] = new_dataset
-        return new_dataset
+        new_im_dataset.staged_changes = self.staged_changes.astype(
+            dtype, casting=casting, base_slabs=[raw_data]
+        )
+        self.parent[self.name] = new_im_dataset
+        return new_im_dataset
 
     @property
     def fillvalue(self):
@@ -1062,17 +1064,35 @@ class InMemoryArrayDataset(DatasetLike):
             chunks = parent.chunks[name]
         self._chunks = chunks
 
-    def as_dtype(self, name, dtype, parent, casting="unsafe"):
+    def _as_dtype(self, name, parent, dtype, casting="unsafe"):
         """
         Return a copy of `self` as a new dataset with the given `name` and `dtype`
         in the group `parent`.
 
-        `casting` should be as in the numpy astype() method.
-
+        `casting` should be as in the NumPy astype() method.
         """
-        return self.__class__(
-            name, self.array.astype(dtype, casting=casting), parent=parent
+        fillvalue = self.fillvalue
+        if fillvalue is not None:
+            fillvalue = self.fillvalue.astype(dtype, casting=casting)
+
+        out = type(self)(
+            name,
+            self.array.astype(dtype, casting=casting),
+            parent=parent,
+            fillvalue=fillvalue,
+            chunks=self.chunks,
         )
+        parent[name] = out
+        return out
+
+    def astype(self, dtype, casting="unsafe"):
+        """
+        Overwrite `self` in place, changing the dtype.
+
+        `casting` should be as in the NumPy astype() method.
+        """
+        return self._as_dtype(self.name, self.parent, dtype, casting=casting)
+
 
     @property
     def array(self):
@@ -1169,29 +1189,27 @@ class InMemorySparseDataset(DatasetLike):
     def data_dict(self) -> dict[Tuple, Slice | np.ndarray]:
         return _staged_changes_to_data_dict(self.staged_changes)
 
-    def as_dtype(self, name, dtype, parent, casting="unsafe"):
+    def astype(self, dtype, casting="unsafe"):
         """
-        Return a copy of `self` as a new dataset with the given `name` and `dtype`
-        in the group `parent`.
+        Overwrite `self` in place, changing the dtype.
 
-        `casting` should be as in the numpy astype() method.
-
+        `casting` should be as in the NumPy astype() method.
         """
-        if self.fillvalue is not None:
-            new_fillvalue = self.fillvalue.astype(dtype, casting=casting)
-        else:
-            new_fillvalue = None
+        fillvalue = self.fillvalue
+        if fillvalue is not None:
+            fillvalue = fillvalue.astype(dtype, casting=casting)
 
         out = type(self)(
-            name=name,
+            name=self.name,
             shape=(),
             dtype=dtype,
-            parent=parent,
+            parent=self.parent,
             chunks=self.chunks,
-            fillvalue=new_fillvalue,
+            fillvalue=fillvalue,
         )
         out.staged_changes = self.staged_changes.astype(dtype, casting=casting)
         out.shape = self.shape
+        self.parent[self.name] = out
         return out
 
     @classmethod
@@ -1250,6 +1268,8 @@ def _staged_changes_to_data_dict(
 
 
 class DatasetWrapper(DatasetLike):
+    dataset: InMemoryDataset | InMemoryArrayDataset | InMemorySparseDataset
+
     def __init__(self, dataset):
         self.dataset = dataset
 
@@ -1274,6 +1294,18 @@ class DatasetWrapper(DatasetLike):
 
     def __getitem__(self, index):
         return self.dataset.__getitem__(index)
+
+    def astype(self, dtype, casting="unsafe"):
+        """Overwrite `self` in place, changing the dtype.
+    
+        This is exclusively possible when converting between NumPy dtypes that are
+        identical once stored on HDF5, such as StringDType ('T')
+        and object strings ('O') (requires h5py >=3.14 and NumPy >=2.0).
+
+        `casting` should be as in the NumPy astype() method.
+        """
+        self.dataset = self.dataset.astype(dtype, casting=casting)
+        return self
 
 
 class InMemoryDatasetID(h5d.DatasetID):

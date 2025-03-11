@@ -119,6 +119,19 @@ def create_base_dataset(
     return write_dataset(f, name, data, chunks=chunks)
 
 
+def _is_vstring_dtype(dtype: np.dtype) -> bool:
+    return (
+        # NpyStrings
+        dtype.kind == "T"
+        # h5py object strings
+        or (
+            dtype.metadata 
+            and "vlen" in dtype.metadata 
+            or "h5py_encoding" in dtype.metadata
+        )
+    )
+
+
 def write_dataset(
     f,
     name,
@@ -181,7 +194,10 @@ def write_dataset(
             pass
         else:
             raise ValueError(f"fillvalues do not match ({fillvalue} != {ds.fillvalue})")
-    if data.dtype != ds.dtype:
+    if (
+        data.dtype != ds.dtype 
+        and not (_is_vstring_dtype(data.dtype) and _is_vstring_dtype(ds.dtype))
+    ):
         raise ValueError(f"dtypes do not match ({data.dtype} != {ds.dtype})")
     # TODO: Handle more than one dimension
     old_shape = ds.shape

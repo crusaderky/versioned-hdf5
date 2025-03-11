@@ -677,7 +677,7 @@ def modify_metadata(
             new_dataset.compression_opts = compression_opts
 
         if dtype:
-            return new_dataset.as_dtype(name, dtype, tmp_parent)
+            return new_dataset._as_dtype(name, tmp_parent, dtype)
 
         return new_dataset
 
