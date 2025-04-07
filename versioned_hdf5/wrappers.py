@@ -591,7 +591,32 @@ def _make_new_dset(
     return data
 
 
-class InMemoryDataset(Dataset):
+class CompressionMixin:
+    name: str
+    parent: InMemoryGroup
+
+    @property
+    def basename(self) -> str:
+        return self.name[len(self.parent.name) + 1 :]
+
+    @property
+    def compression(self):
+        return self.parent.compression[self.basename]
+
+    @compression.setter
+    def compression(self, value):
+        self.parent.set_compression(self.basename, value)
+
+    @property
+    def compression_opts(self):
+        return self.parent.compression_opts[self.basename]
+
+    @compression_opts.setter
+    def compression_opts(self, value):
+        self.parent.set_compression_opts(self.basename, value)
+
+
+class InMemoryDataset(Dataset, CompressionMixin):
     """
     Class that looks like a h5py.Dataset but is backed by a versioned dataset
 
@@ -637,28 +662,6 @@ class InMemoryDataset(Dataset):
     @property
     def data_dict(self) -> dict[Tuple, Slice | np.ndarray]:
         return _staged_changes_to_data_dict(self.staged_changes)
-
-    @property
-    def compression(self):
-        name = self.name
-        if self.parent.name in name:
-            name = name[len(self.parent.name) + 1 :]
-        return self.parent.compression[name]
-
-    @compression.setter
-    def compression(self, value):
-        self.parent.set_compression(self.item, value)
-
-    @property
-    def compression_opts(self):
-        name = self.name
-        if self.parent.name in name:
-            name = name[len(self.parent.name) + 1 :]
-        return self.parent.compression_opts[self.name]
-
-    @compression_opts.setter
-    def compression_opts(self, value):
-        self.parent.set_compression_opts(self.name, value)
 
     def as_dtype(self, name, dtype, parent, casting="unsafe"):
         """
@@ -1024,36 +1027,8 @@ class DatasetLike:
         for i in range(shape[0]):
             yield self[i]
 
-    @property
-    def compression(self):
-        name = self.name
-        if self.parent.name in name:
-            name = name[len(self.parent.name) + 1 :]
-        return self.parent.compression[name]
 
-    @compression.setter
-    def compression(self, value):
-        name = self.name
-        if self.parent.name in name:
-            name = name[len(self.parent.name) + 1 :]
-        self.parent.set_compression(name, value)
-
-    @property
-    def compression_opts(self):
-        name = self.name
-        if self.parent.name in name:
-            name = name[len(self.parent.name) + 1 :]
-        return self.parent.compression_opts[name]
-
-    @compression_opts.setter
-    def compression_opts(self, value):
-        name = self.name
-        if self.parent.name in name:
-            name = name[len(self.parent.name) + 1 :]
-        self.parent.set_compression_opts(name, value)
-
-
-class InMemoryArrayDataset(DatasetLike):
+class InMemoryArrayDataset(DatasetLike, CompressionMixin):
     """
     Class that looks like a h5py.Dataset but is backed by an array
     """
@@ -1132,7 +1107,7 @@ class InMemoryArrayDataset(DatasetLike):
             self._array = new_array
 
 
-class InMemorySparseDataset(DatasetLike):
+class InMemorySparseDataset(DatasetLike, CompressionMixin):
     """
     Class that looks like a Dataset that has no data (only the fillvalue)
     """
