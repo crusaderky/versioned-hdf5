@@ -39,6 +39,7 @@ if cython.compiled:  # pragma: nocover
     )
 
 
+NP_VERSION = tuple(int(i) for i in np.__version__.split(".")[:3])
 T = TypeVar("T", bound=np.generic)
 Casting = Literal["no", "equiv", "safe", "same_kind", "unsafe"]
 
@@ -560,24 +561,72 @@ class StagedChangesArray(MutableMapping[Any, T]):
         self,
         dtype: DTypeLike,
         casting: Casting = "unsafe",
+        base_slabs: Sequence[NDArray[T]] | None = None,
     ) -> StagedChangesArray:
         """Return a new StagedChangesArray with a different dtype.
 
-        Chunks that are not yet staged are loaded from the base slabs.
+        Parameters
+        ----------
+        dtype:
+            The new dtype.
+        casting:
+            As per numpy.astype.
+        base_slabs: optional
+            If provided, the new base slabs. Must have the same shapes as the original
+            base_slabs be of the new dtype.
+            If omitted, load into memory all chunks that are not yet staged and
+            dereference the previous base slabs.
         """
+        dtype = np.dtype(dtype)
         if self.dtype == dtype:
             return self.copy(deep=True)
 
+        if self.dtype.kind == "O" and dtype.kind == "T" and NP_VERSION < (2, 2, 3):
+            # Work around bug in conversion from array of bytes objects to NpyStrings
+            # https://github.com/numpy/numpy/issues/28269
+            # Note that this can be memory intensive if the staged slabs
+            # are individually large.
+            def _astype(arr: NDArray) -> NDArray:
+                return arr.astype("U", casting=casting).astype(dtype, casting=casting)
+        else:
+
+            def _astype(arr: NDArray) -> NDArray:
+                return arr.astype(dtype, casting=casting)
+
         out = self.copy(deep=False)
-        out.load()  # Create new slabs and set all the base slabs to None
-        out.slabs[0] = np.broadcast_to(
-            out.fill_value.astype(dtype, casting=casting),
-            out.chunk_size,
-        )
-        out.slabs[1:] = [
-            slab.astype(dtype, casting=casting) if slab is not None else None
-            for slab in out.slabs[1:]
-        ]
+        if base_slabs is None:
+            # Load all base slabs, if any, into new staged slabs
+            # and set all the base slabs to None
+            out.load()
+        else:
+            # Hot-swap the base slabs
+            for i, old in enumerate(out.base_slabs):
+                if old is None:
+                    continue
+                new = base_slabs[i]
+                if new is None:
+                    raise ValueError(f"new base_slabs[{i}] is None but old one isn't")
+                if new.dtype != dtype:
+                    raise ValueError(
+                        f"base_slabs[{i}] mismatched dtype: {new.dtype} != {dtype}"
+                    )
+                if new.shape != old.shape:
+                    raise ValueError(
+                        f"base_slabs[{i}] mismatched shape: {new.shape} != {old.shape}"
+                    )
+                out.slabs[i + 1] = new  # offset by the full slab at index 0
+
+        # Convert the full slab; this has to happen after calling out.load().
+        out.slabs[0] = np.broadcast_to(_astype(out.fill_value), out.chunk_size)
+
+        # Convert the staged slabs. If base_slabs=None, this also converts all the
+        # chunks we just loaded from base slabs with out.load() above.
+        for i in range(out.n_base_slabs + 1, out.n_slabs):
+            slab = out.slabs[i]
+            if slab is not None:
+                slab = _astype(slab)
+                out.slabs[i] = slab
+
         return out
 
     def refill(self, fill_value: Any) -> StagedChangesArray[T]:

@@ -485,6 +485,28 @@ class InMemoryDataset(Dataset):
         """
         return self.id.raw_data.dtype
 
+    def astype(self, dtype: DTypeLike, casting: Casting = "unsafe") -> Self:
+        """Replace `self` in the parent's group, changing the dtype.
+
+        This is exclusively possible when converting between NumPy dtypes that are
+        identical once stored on HDF5, such as StringDType ('T')
+        and object strings ('O') (requires h5py >=3.14 and NumPy >=2.0).
+
+        `casting` should be as in the NumPy astype() method.
+        """
+        # In most cases, the new raw_data is a read-only AsTypeView object.
+        # However, if the new dtype is 'T' (StringDType), thew new raw_data will be a
+        # writeable h5py.Dataset object instead (requires h5py >=3.14 and NumPy >=2.0).
+        raw_data = self.id.raw_data.astype(dtype)
+        if not isinstance(raw_data, Dataset):  # read-only AsTypeView
+            raise ValueError("Cannot change dtype in place")
+        self.id.raw_data = raw_data
+        if "staged_changes" in self.__dict__:
+            self.staged_changes = self.staged_changes.astype(
+                dtype, casting=casting, base_slabs=[raw_data]
+            )
+        return self
+
     @property
     def shape(self) -> tuple[int, ...]:
         return self.id.shape
@@ -853,6 +875,10 @@ class InMemoryArrayDataset(DatasetLike):
             chunks = parent.chunks[name]
         self.chunks = chunks
 
+    def astype(self, dtype: DTypeLike, casting: Casting = "unsafe") -> Self:
+        """Overwrite `self` in place, changing the dtype."""
+        self._array = self._array.astype(dtype, copy=False)
+
     @property
     def shape(self) -> tuple[int, ...]:
         return self._array.shape
@@ -942,6 +968,15 @@ class InMemorySparseDataset(DatasetLike):
     def dtype(self):
         return self.staged_changes.dtype
 
+    def astype(self, dtype: DTypeLike, casting: Casting = "unsafe") -> Self:
+        """
+        Overwrite `self` in place, changing the dtype.
+
+        `casting` should be as in the NumPy astype() method.
+        """
+        self.staged_changes = self.staged_changes.astype(dtype, casting=casting)
+        return self
+
     @classmethod
     def from_dataset(cls, dataset, parent=None):
         # np.testing.assert_equal(dataset[()], dataset.fillvalue)
@@ -1024,6 +1059,18 @@ class DatasetWrapper(DatasetLike):
 
     def __getitem__(self, index):
         return self.dataset.__getitem__(index)
+
+    def astype(self, dtype: DTypeLike, casting: Casting = "unsafe") -> Self:
+        """Overwrite `self` in place, changing the dtype.
+
+        This is exclusively possible when converting between NumPy dtypes that are
+        identical once stored on HDF5, such as StringDType ('T')
+        and object strings ('O') (requires h5py >=3.14 and NumPy >=2.0).
+
+        `casting` should be as in the NumPy astype() method.
+        """
+        self.dataset = self.dataset.astype(dtype, casting=casting)
+        return self
 
 
 class InMemoryDatasetID(h5d.DatasetID):
