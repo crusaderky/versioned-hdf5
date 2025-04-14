@@ -1220,23 +1220,11 @@ def test_modify_metadata_compression_default_compression(vfile, obj, metadata_op
         ),
     ],
 )
-@pytest.mark.parametrize(
-    ("library"),
-    [
-        "hdf5plugin",
-        "tables",
-    ],
-)
 def test_modify_metadata_compression_nondefault_compression(
-    vfile, obj, metadata_opts, library
+    vfile, obj, metadata_opts
 ):
     """Test that setting compression via modify_metadata works for nondefault compression."""
-    if library == "tables" and Version(importlib.metadata.version("numpy")) >= Version(
-        "2"
-    ):
-        pytest.skip("Skipping test; pytables is incompatible with numpy>=2")
-    pytest.importorskip(library)
-
+    pytest.importorskip("hdf5plugin")
     setup_vfile(vfile)
 
     f = vfile.f

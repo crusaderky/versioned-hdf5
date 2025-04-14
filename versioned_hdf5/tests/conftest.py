@@ -5,7 +5,9 @@ import uuid
 from collections.abc import Callable
 
 import h5py
-from pytest import fixture
+import numpy as np
+from packaging.version import Version
+from pytest import fixture, skip
 
 from ..api import VersionedHDF5File
 from ..backend import initialize
