@@ -4,27 +4,39 @@ from typing import Any
 
 import ndindex
 import numpy as np
+from numpy.typing import ArrayLike, DTypeLike
+
+NP_VERSION = tuple(int(i) for i in np.__version__.split(".")[:3])
 
 
-def asarray(a, dtype=None):
-    """Variant of np.asarray(a, dtype=dtype), with two differences:
+def asarray(a: ArrayLike, /, *, dtype: DTypeLike | None = None):
+    """Variant of np.asarray(a, dtype=dtype), with some differences:
 
     1. If a is a numpy-like array, don't coerce it to a numpy.ndarray
     2. If a has a ABI-compatible dtype, return a view instead of a copy
        (works around https://github.com/numpy/numpy/issues/27509)
+    3. Work around https://github.com/numpy/numpy/issues/28269
+       on NumPy >=2.0.0,<2.2.3 when converting from arrays of object strings to
+       NpyStrings
     """
-    if not hasattr(a, "__array__") or np.isscalar(a):
+    if (
+        not hasattr(a, "ndim") 
+        or not hasattr(a, "shape") 
+        or not hasattr(a, "dtype") 
+        or not hasattr(a, "__array__")
+        or np.isscalar(a)
+    ):
         return np.asarray(a, dtype=dtype)
 
     if dtype is None:
         return a
-
-    dtype = np.dtype(dtype)
     if a.dtype == dtype:
         return a
 
+    dtype = np.dtype(dtype)
+
     if (
-        dtype.itemsize == a.itemsize
+        dtype.itemsize == a.dtype.itemsize
         and dtype.kind in ("i", "u")
         and a.dtype.kind in ("i", "u")
         and hasattr(a, "view")
@@ -33,7 +45,15 @@ def asarray(a, dtype=None):
         # np.array(-1).astype("u1") doesn't raise and returns 255!
         return a.view(dtype)
 
-    return a.astype(dtype)
+    if NP_VERSION < (2, 2, 3) and a.dtype.kind == "O" and dtype.kind == "T":
+        # Work around bug in conversion from array of bytes objects to NpyStrings
+        # https://github.com/numpy/numpy/issues/28269
+        # Note that this can be memory intensive.
+        return asarray(asarray(a, dtype="U"), dtype=dtype)
+
+    if hasattr(a, "astype"):
+        return a.astype(dtype)
+    return np.asarray(a, dtype=dtype)
 
 
 def ix_with_slices(*idx: Any, shape: tuple[int, ...]) -> tuple:

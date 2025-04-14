@@ -39,9 +39,7 @@ if cython.compiled:  # pragma: nocover
     )
 
 
-NP_VERSION = tuple(int(i) for i in np.__version__.split(".")[:3])
 T = TypeVar("T", bound=np.generic)
-Casting = Literal["no", "equiv", "safe", "same_kind", "unsafe"]
 
 
 class StagedChangesArray(MutableMapping[Any, T]):
@@ -560,7 +558,6 @@ class StagedChangesArray(MutableMapping[Any, T]):
     def astype(
         self,
         dtype: DTypeLike,
-        casting: Casting = "unsafe",
         base_slabs: Sequence[NDArray[T]] | None = None,
     ) -> StagedChangesArray:
         """Return a new StagedChangesArray with a different dtype.
@@ -569,8 +566,6 @@ class StagedChangesArray(MutableMapping[Any, T]):
         ----------
         dtype:
             The new dtype.
-        casting:
-            As per numpy.astype.
         base_slabs: optional
             If provided, the new base slabs. Must have the same shapes as the original
             base_slabs be of the new dtype.
@@ -580,18 +575,6 @@ class StagedChangesArray(MutableMapping[Any, T]):
         dtype = np.dtype(dtype)
         if self.dtype == dtype:
             return self.copy(deep=True)
-
-        if self.dtype.kind == "O" and dtype.kind == "T" and NP_VERSION < (2, 2, 3):
-            # Work around bug in conversion from array of bytes objects to NpyStrings
-            # https://github.com/numpy/numpy/issues/28269
-            # Note that this can be memory intensive if the staged slabs
-            # are individually large.
-            def _astype(arr: NDArray) -> NDArray:
-                return arr.astype("U", casting=casting).astype(dtype, casting=casting)
-        else:
-
-            def _astype(arr: NDArray) -> NDArray:
-                return arr.astype(dtype, casting=casting)
 
         out = self.copy(deep=False)
         if base_slabs is None:
@@ -617,14 +600,14 @@ class StagedChangesArray(MutableMapping[Any, T]):
                 out.slabs[i + 1] = new  # offset by the full slab at index 0
 
         # Convert the full slab; this has to happen after calling out.load().
-        out.slabs[0] = np.broadcast_to(_astype(out.fill_value), out.chunk_size)
+        out.slabs[0] = np.broadcast_to(asarray(out.fill_value, dtype), out.chunk_size)
 
         # Convert the staged slabs. If base_slabs=None, this also converts all the
         # chunks we just loaded from base slabs with out.load() above.
         for i in range(out.n_base_slabs + 1, out.n_slabs):
             slab = out.slabs[i]
             if slab is not None:
-                slab = _astype(slab)
+                slab = asarray(slab, dtype)
                 out.slabs[i] = slab
 
         return out
