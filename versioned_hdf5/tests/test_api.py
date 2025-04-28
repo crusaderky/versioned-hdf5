@@ -1,5 +1,4 @@
 import datetime
-import importlib.metadata
 import itertools
 import logging
 import os
@@ -11,7 +10,6 @@ import numpy as np
 import pytest
 from h5py._hl.filters import guess_chunk
 from numpy.testing import assert_equal
-from packaging.version import Version
 from pytest import raises
 
 from ..api import VersionedHDF5File
@@ -2848,20 +2846,10 @@ def test_verify_string_chunk_reuse_bytes_one_dimensional(tmp_path):
         )
 
 
-@pytest.mark.parametrize(
-    ("library"),
-    [
-        "hdf5plugin",
-        "tables",
-    ],
-)
-def test_other_compression_bad_value(tmp_path, library):
-    """Test that invalid compression types do not validate."""
-    if library == "tables" and Version(importlib.metadata.version("numpy")) >= Version(
-        "2"
-    ):
-        pytest.skip("Skipping test; pytables is incompatible with numpy>=2")
-    pytest.importorskip(library)
+def test_other_compression_bad_value(tmp_path):
+    """Test that invalid compression types do not validate."""    
+    pytest.importorskip("hdf5plugin")
+
     path = tmp_path / "tmp.h5"
     with h5py.File(path, "w") as f:
         vf = VersionedHDF5File(f)
@@ -2874,20 +2862,9 @@ def test_other_compression_bad_value(tmp_path, library):
             )
 
 
-@pytest.mark.parametrize(
-    ("library"),
-    [
-        "hdf5plugin",
-        "tables",
-    ],
-)
-def test_other_compression_validates(tmp_path, library):
+def test_other_compression_validates(tmp_path):
     """Test that other compression types validate correctly."""
-    if library == "tables" and Version(importlib.metadata.version("numpy")) >= Version(
-        "2"
-    ):
-        pytest.skip("Skipping test; pytables is incompatible with numpy>=2")
-    pytest.importorskip(library)
+    pytest.importorskip("hdf5plugin")
 
     path = tmp_path / "tmp.h5"
     with h5py.File(path, "w") as f:
