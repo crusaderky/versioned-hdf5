@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from functools import cache
 from typing import Any
 
 import ndindex
@@ -7,6 +9,44 @@ import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
 
 from versioned_hdf5.typing_ import ArrayProtocol
+
+
+class Config:
+    @property
+    def ENABLE_CHUNK_REUSE_VALIDATION(self) -> bool:  # noqa: N802
+        """Enable pedantic validation of chunk reuse.
+
+        True
+            Test that if a chunk on disk and a staged chunk in memory have
+            the same hash, they are actually identical point by point.
+            This is a very costly check, not recommended in production.
+        False
+            Assume that if two chunks have the same sha256 hash, there won't be
+            collisions. This is normally a safe assumption short of bugs in the hashing
+            algorithm.
+
+        Default: False.
+        """
+        return self._get("ENABLE_CHUNK_REUSE_VALIDATION")
+
+    def cache_clear(self):
+        self._get.cache_clear()
+
+    @cache  # noqa: B019
+    def _get(self, name: str) -> bool:
+        """Get the value of the flag from the environment variable."""
+        raw = os.getenv(name, "false").lower()
+        if raw in ("1", "true"):
+            return True
+        if raw in ("0", "false"):
+            return False
+        raise ValueError(
+            f"Invalid value for {name}: "
+            f"Expected '1', 'true', '0', or 'false'; got {raw!r}."
+        )
+
+
+config = Config()
 
 
 def asarray(a: ArrayLike, /, *, dtype: DTypeLike | None = None):

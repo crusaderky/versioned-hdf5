@@ -9,6 +9,12 @@ import pytest
 
 from versioned_hdf5 import VersionedHDF5File
 from versioned_hdf5.backend import initialize
+from versioned_hdf5.tools import config
+
+
+@pytest.fixture(autouse=True)
+def clear_config_cache():
+    config.cache_clear()
 
 
 # Run tests marked with @pytest.mark.slow last. See

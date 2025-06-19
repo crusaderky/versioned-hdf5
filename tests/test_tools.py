@@ -6,9 +6,32 @@ from hypothesis import strategies as st
 from hypothesis.extra import numpy as stnp
 from numpy.testing import assert_array_equal
 
-from versioned_hdf5.tools import asarray, ix_with_slices
+from versioned_hdf5.tools import asarray, config, ix_with_slices
 
 from .test_typing import MinimalArray
+
+
+@pytest.mark.parametrize("value", ["1", "true", "True", "TRUE"])
+def test_config_true(monkeypatch, value):
+    monkeypatch.setenv("ENABLE_CHUNK_REUSE_VALIDATION", value)
+    assert config.ENABLE_CHUNK_REUSE_VALIDATION
+
+
+@pytest.mark.parametrize("value", ["0", "false", "False", "FALSE"])
+def test_config_false(monkeypatch, value):
+    monkeypatch.setenv("ENABLE_CHUNK_REUSE_VALIDATION", value)
+    assert not config.ENABLE_CHUNK_REUSE_VALIDATION
+
+
+def test_config_unset(monkeypatch):
+    monkeypatch.delenv("ENABLE_CHUNK_REUSE_VALIDATION", raising=False)
+    assert not config.ENABLE_CHUNK_REUSE_VALIDATION
+
+
+def test_config_invalid(monkeypatch):
+    monkeypatch.setenv("ENABLE_CHUNK_REUSE_VALIDATION", "bad")
+    with pytest.raises(ValueError, match="ENABLE_CHUNK_REUSE_VALIDATION.*bad"):
+        config.ENABLE_CHUNK_REUSE_VALIDATION
 
 
 def test_asarray():

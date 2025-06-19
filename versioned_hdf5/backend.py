@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import datetime
 import logging
-import os
 import textwrap
 from collections.abc import Iterator
 
@@ -15,6 +14,7 @@ from ndindex import ChunkSize, Slice, Tuple, ndindex
 from numpy.testing import assert_array_equal
 
 from versioned_hdf5.hashtable import Hashtable
+from versioned_hdf5.tools import config
 
 DEFAULT_CHUNK_SIZE = 2**12
 DATA_VERSION = 4
@@ -179,10 +179,6 @@ def write_dataset(
     slices_to_write = {}
     chunk_size = chunks[0]
 
-    validate_reused_chunks = os.environ.get(
-        "ENABLE_CHUNK_REUSE_VALIDATION", "false"
-    ).lower() in ("1", "true")
-
     with Hashtable(f, name) as hashtable:
         old_chunks = hashtable.largest_index
         chunks_reused = 0
@@ -196,7 +192,7 @@ def write_dataset(
                     hashed_slice = hashtable[data_hash]
                     slices[data_slice] = hashed_slice
 
-                    if validate_reused_chunks:
+                    if config.ENABLE_CHUNK_REUSE_VALIDATION:
                         _verify_new_chunk_reuse(
                             raw_dataset=ds,
                             new_data=data,
@@ -358,10 +354,6 @@ def write_dataset_chunks(f, name, data_dict):
     chunks = tuple(raw_data.attrs["chunks"])
     chunk_size = chunks[0]
 
-    validate_reused_chunks = os.environ.get(
-        "ENABLE_CHUNK_REUSE_VALIDATION", "false"
-    ).lower() in ("1", "true")
-
     with Hashtable(f, name) as hashtable:
         old_chunks = hashtable.largest_index
         chunks_reused = 0
@@ -386,7 +378,7 @@ def write_dataset_chunks(f, name, data_dict):
                     hashed_slice = hashtable[data_hash]
                     slices[chunk] = hashed_slice
 
-                    if validate_reused_chunks:
+                    if config.ENABLE_CHUNK_REUSE_VALIDATION:
                         _verify_new_chunk_reuse(
                             raw_dataset=raw_data,
                             new_data=data_s,
