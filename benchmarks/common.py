@@ -2,6 +2,7 @@ import os
 
 import h5py
 import numpy as np
+from numpy.typing import DTypeLike
 
 from versioned_hdf5 import VersionedHDF5File
 
@@ -43,3 +44,26 @@ class Benchmark:
     def teardown(self, *args, **kwargs):
         self.file.close()
         os.remove("bench.hdf5")
+
+    def rand_strings(
+        self, shape: tuple[int, ...], min_nchars: int, max_nchars: int, dtype: DTypeLike
+    ) -> np.ndarray:
+        """Generate a ndarray of random strings"""
+        assert 0 <= min_nchars <= max_nchars
+        rand_chars = (
+            self.rng.integers(
+                ord("0"), ord("z"), (np.prod(shape), max_nchars), dtype=np.uint8
+            )
+            .view("S1")
+            .astype("U1")
+            .tolist()
+        )
+        if min_nchars < max_nchars:
+            res = [
+                "".join(row)[: self.rng.integers(min_nchars, max_nchars)]
+                for row in rand_chars
+            ]
+        else:
+            res = ["".join(row) for row in rand_chars]
+
+        return np.asarray(res, dtype=dtype).reshape(shape)
