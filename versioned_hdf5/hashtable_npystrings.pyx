@@ -28,7 +28,7 @@ from versioned_hdf5.npystrings_compat cimport (
 cpdef hash_npystrings_chunk(np.ndarray arr):
     cdef EVP_MD_CTX *ctx = NULL
     cdef np.NpyIter *iter = NULL
-    cdef np.NpyIter_IterNextFunc *iternext = NULL
+    cdef np.NpyIter_IterNextFunc *iternext
     cdef char *data
     cdef char **dataptr
     cdef np.npy_intp *strideptr
@@ -87,7 +87,7 @@ cpdef hash_npystrings_chunk(np.ndarray arr):
         # Finally return digest as bytes
         if EVP_DigestFinal_ex(ctx, digest, &digest_len) != 1:
             raise RuntimeError("EVP_DigestFinal_ex failed")
-        return bytes(digest)
+        return bytes(digest[:digest_len])
 
     finally:
         np.NpyIter_Deallocate(iter)
