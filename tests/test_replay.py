@@ -1,4 +1,3 @@
-import importlib.metadata
 import pathlib
 import shutil
 import subprocess
@@ -11,7 +10,6 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 from ndindex import Slice
-from packaging.version import Version
 
 from versioned_hdf5 import VersionedHDF5File
 from versioned_hdf5.hashtable import Hashtable
@@ -1254,24 +1252,9 @@ def test_modify_metadata_compression_default_compression(vfile, obj, metadata_op
         ),
     ],
 )
-@pytest.mark.parametrize(
-    ("library"),
-    [
-        "hdf5plugin",
-        "tables",
-    ],
-)
-def test_modify_metadata_compression_nondefault_compression(
-    vfile, obj, metadata_opts, library
-):
-    """Test that setting compression via modify_metadata works for nondefault
-    compression.
-    """
-    if library == "tables" and Version(importlib.metadata.version("numpy")) >= Version(
-        "2"
-    ):
-        pytest.skip("Skipping test; pytables is incompatible with numpy>=2")
-    pytest.importorskip(library)
+def test_modify_metadata_compression_nondefault_compression(vfile, obj, metadata_opts):
+    """Test that setting compression via modify_metadata works for nondefault compression."""
+    pytest.importorskip("hdf5plugin")
 
     setup_vfile(vfile)
 
