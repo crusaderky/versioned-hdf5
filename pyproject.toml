@@ -9,7 +9,8 @@ build-backend = "mesonpy"
 
 [project]
 name = "versioned-hdf5"
-dynamic = ["version"]
+# dynamic = ["version"]
+version = "0.0.1"
 authors = [
   { name="Quansight" },
 ]
@@ -18,7 +19,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: BSD License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
@@ -28,7 +28,8 @@ dependencies = [
     "ndindex>=1.5.1",
 ]
 urls = { Homepage = "https://github.com/deshaw/versioned-hdf5" }
-license = { file = 'LICENSE' }
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 
 [tool.ruff]
 line-length = 88
@@ -173,53 +174,73 @@ H5PY_DIRECT_VFD = "0"
 [tool.pixi.workspace]
 channels = ["https://prefix.dev/conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64", "win-64"]
+preview = ["pixi-build"]
 
-[tool.pixi.dependencies]
-h5py = "*"
-ndindex = "*"
+[tool.pixi.package.build.backend]
+name = "pixi-build-python"
+version = "*"
 
-[tool.pixi.feature.build.dependencies]
-# Needed for --no-build-isolation
-cython = "*"
+[tool.pixi.package.build.config]
+extra-args = [
+    # "--editable", <value>?
+    "-Ceditable-verbose=true",
+    "-Cbuilddir=$CONDA_PREFIX/build",
+]
+
+[tool.pixi.package.host-dependencies]
 meson-python = "*"
+uv = "*" # interfaces with meson-python instead of pip
+cython = "*"
 setuptools-scm = "*"
-pip = "*"
-wheel = "*"
-python-build = "*"
-twine = "*"
 zlib = "*"
+hdf5 = "*"
+numpy = "*"
 
-[tool.pixi.feature.build.target.linux.dependencies]
+[tool.pixi.package.target.linux.host-dependencies]
 gcc = "*"
 patchelf = "*"
 
-[tool.pixi.feature.build.target.osx.dependencies]
+[tool.pixi.package.target.osx.host-dependencies]
 clang = "*"
 patchelf = "*"
 
-[tool.pixi.feature.build.target.win.dependencies]
+[tool.pixi.package.target.win.host-dependencies]
 clang = "*"
 llvm-tools = "*"
 pkg-config = "*"  # Needed to find hdf5
 
-[tool.pixi.feature.build.target.win.activation.env]
-CC = "clang"
-LD = "llvm-ar"
+[tool.pixi.package.run-dependencies]
+numpy = ">=1.24.4"
+# h5py = ">=3.8.0"
+ndindex = ">=1.5.1"
 
-[tool.pixi.feature.build.tasks]
-# Perform a regular build and install of versioned-hdf5 in the current environment
-install = "python -m pip install . -v --no-build-isolation --no-dependencies"
-uninstall = "python -m pip uninstall -y versioned-hdf5"
-# Perform editable install, but do nothing if package was already installed by
-# either 'install' or 'editable-install'. Add --force to force re-installation.
-# This task is a dependency of all tasks that need versioned-hdf5 to be installed.
-editable-install = "python ci/editable_install.py"
-sdist = "python -m build --sdist --no-isolation"
+[tool.pixi.package.build.target.win.config]
+env = { CC = "clang", LD = "llvm-ar" }
+
+[tool.pixi.dev]
+versioned-hdf5 = { path = "." }
+
+[tool.pixi.dependencies]
+versioned-hdf5 = { path = "." }
+
+[tool.pixi.feature.smoke.dependencies]
+h5py = "*"
+
+[tool.pixi.feature.smoke.tasks]
+smoke = { cmd = "python ci/smoke_test.py" }
+
+[tool.pixi.feature.dist.dependencies]
+wheel = "*"
+python-build = "*"
+twine = "*"
+
+[tool.pixi.feature.dist.tasks]
+sdist = "python -m build --sdist"
 # Build a wheel for the current platform and python only.
 # For debugging only. Do not use for release; use cibuildwheel instead.
-wheel = "python -m build --wheel --no-isolation"
+wheel = "python -m build --wheel"
 twine-check = "twine check dist/*"
-smoke = { cmd = "python ci/smoke_test.py", depends-on = ["editable-install"] }
+dist = { depends-on = ["sdist", "wheel", "twine-check"] }
 
 # Absolute minimum versions of build and runtime dependencies.
 # Compilation against an old stack of dependencies is very fiddly:
@@ -227,19 +248,24 @@ smoke = { cmd = "python ci/smoke_test.py", depends-on = ["editable-install"] }
 # - On MacOS Intel, h5py==3.8.0 fails to compile due to import issues
 # - On Windows, meson fails to find libhdf5 1.10, and crashes with libhdf5 1.12.
 
+# [tool.pixi.feature.mindeps.host-dependencies]
+# meson = "=1.2.0"
+# meson-python = "=0.15.0"
+# setuptools-scm = "=8.1"
+# cython = "=3.0.10"
+
 [tool.pixi.feature.mindeps.dependencies]
-meson = "=1.2.0"
-meson-python = "=0.15.0"
-setuptools-scm = "=8.1"
-cython = "=3.0.10"
+python = "=3.10"
 numpy = "=1.24.4"
 ndindex = "=1.5.1"
 
-[tool.pixi.feature.mindeps.target.linux-64.dependencies]  # Intel
+# [tool.pixi.feature.mindeps.target.linux.host-dependencies]
+# gcc = "=10"
+
+[tool.pixi.feature.mindeps.target.linux-64.dependencies]
 # Note: apt on Ubuntu 24.04 (ubuntu-latest github runner) installs
 # hdf5=1.10.10, which however is not available on conda
 hdf5 = "=1.10.6"
-gcc = "=10"
 
 # h5py=3.8.0 in conda-forge requires hdf5 >=1.12.2,<1.14.1;
 # build it from sources instead.
@@ -253,22 +279,25 @@ no-binary = ["h5py"]
 # No binaries available for very old versions on Linux ARM
 hdf5 = "=1.12.2"
 h5py = "=3.8.0"
-gcc = "=10"
 
-[tool.pixi.feature.mindeps.target.osx.dependencies]  # Both ARM and Intel
+# [tool.pixi.feature.mindeps.target.osx.host-dependencies]  # Both ARM and Intel
+# clang = "=14"
+
+[tool.pixi.feature.mindeps.target.osx.dependencies]
 # No binaries available for very old versions on MacOS ARM
 # MacOS Intel fails to compile h5py 3.8.0 from sources
 hdf5 = "=1.12.2"
 h5py = "=3.8.0"
-clang = "=14"
 
-[tool.pixi.feature.mindeps.target.win-64.dependencies]  # Intel
+# [tool.pixi.feature.mindeps.target.win-64.host-dependencies]  # Intel
+# clang = "=14"
+# llvm-tools = "=14"
+
+[tool.pixi.feature.mindeps.target.win-64.dependencies]
 # Meson fails to detect hdf5 1.10
 # hdf5 1.12 shows double-linking issues at runtime
 hdf5 = "=1.14.0"
 h5py = "=3.9.0"
-clang = "=14"
-llvm-tools = "=14"
 
 [tool.pixi.feature.hdf5-112]
 # hdf5 1.12.2 is the minimum version supported by h5py binaries in conda-forge.
@@ -282,21 +311,29 @@ hdf5 = "=1.12.2"
 
 [tool.pixi.feature.np126.dependencies]
 numpy = "=1.26"
+h5py = "*"
 [tool.pixi.feature.np200.dependencies]
 numpy = "=2.0"
+h5py = "*"
 
 [tool.pixi.feature.py310.dependencies]
 python = "=3.10"
+h5py = "*"
 [tool.pixi.feature.py311.dependencies]
 python = "=3.11"
+h5py = "*"
 [tool.pixi.feature.py312.dependencies]
 python = "=3.12"
+h5py = "*"
 [tool.pixi.feature.py313.dependencies]
 python = "=3.13"
+h5py = "*"
 [tool.pixi.feature.py314.dependencies]
 python = "=3.14"
+h5py = "*"
 
 [tool.pixi.feature.h5py-dev.dependencies]
+python = "=3.14"
 numpy = "*"
 hdf5 = "*"
 ndindex = "*"
@@ -311,7 +348,7 @@ hypothesis = "*"
 packaging = "*"
 
 [tool.pixi.feature.test.tasks]
-test = { cmd = "pytest", depends-on = ["editable-install"] }
+test = { cmd = "pytest" }
 
 [tool.pixi.feature.filters.dependencies]
 hdf5plugin = "*"
@@ -320,7 +357,7 @@ hdf5plugin = "*"
 ipython = "*"
 
 [tool.pixi.feature.ipython.tasks]
-ipython = { cmd = "ipython", depends-on = ["editable-install"] }
+ipython = { cmd = "ipython" }
 
 [tool.pixi.feature.lint.dependencies]
 pre-commit = "*"
@@ -334,7 +371,7 @@ asv = "*"
 
 [tool.pixi.feature.bench.tasks]
 asv-machine = "asv machine --yes"
-asv-run = { cmd = "asv run --python=same --quick --set-commit-hash $(git rev-parse HEAD)", depends-on = ["editable-install"] }
+asv-run = "asv run --python=same --quick --set-commit-hash $(git rev-parse HEAD)"
 
 [tool.pixi.feature.docs.dependencies]
 graphviz = "*"
@@ -344,21 +381,22 @@ sphinx = "*"
 sphinx-multiversion = "*"
 
 [tool.pixi.feature.docs.tasks]
-docs = { cmd = "make html", cwd = "docs", depends-on = ["editable-install"] }
-docs-multiversion = { cmd = "sphinx-multiversion . _build/html", cwd = "docs", depends-on = ["editable-install"] }
+docs = { cmd = "make html", cwd = "docs" }
+docs-multiversion = { cmd = "sphinx-multiversion . _build/html", cwd = "docs" }
 
 [tool.pixi.environments]
-default = { features = ["py314", "ipython", "build", "test", "filters", "bench"] }
-bench = { features = ["py314", "build", "bench"] }
-docs = { features = ["py314", "build", "docs"] }
+default = { features = ["py314", "ipython", "dist", "test", "filters", "bench"] }
+bench = { features = ["py314", "bench"] }
+smoke = { features = ["py314", "smoke"] }
+docs = { features = ["py314", "docs"] }
 lint = { features = ["lint"], no-default-feature = true }
-mindeps = { features = ["py310", "mindeps", "build", "test", "bench"], no-default-feature = true }
-hdf5-112 = { features = ["py310", "hdf5-112", "build", "test", "filters"] }
-np126 = { features = ["py310", "np126", "build", "test", "filters"] }
-np200 = { features = ["py310", "np200", "build", "test", "filters"] }
-py310 = { features = ["py310", "build", "test", "filters"] }
-py311 = { features = ["py311", "build", "test", "filters"] }
-py312 = { features = ["py312", "build", "test", "filters"] }
-py313 = { features = ["py313", "build", "test", "filters"] }
-py314 = { features = ["py314", "build", "test", "filters"] }
-h5py-dev = { features = ["py314", "h5py-dev", "build", "test"], no-default-feature = true }
+mindeps = { features = ["mindeps", "test", "bench"] }
+hdf5-112 = { features = ["py310", "hdf5-112", "test", "filters"] }
+np126 = { features = ["py310", "np126", "test", "filters"] }
+np200 = { features = ["py310", "np200", "test", "filters"] }
+py310 = { features = ["py310", "test", "filters"] }
+py311 = { features = ["py311", "test", "filters"] }
+py312 = { features = ["py312", "test", "filters"] }
+py313 = { features = ["py313", "test", "filters"] }
+py314 = { features = ["py314", "test", "filters"] }
+h5py-dev = { features = ["h5py-dev", "test"] }
