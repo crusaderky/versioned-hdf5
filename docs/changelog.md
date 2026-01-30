@@ -1,6 +1,39 @@
 Changelog
 =========
 
+## 2.2.2 (2026-01-30)
+
+### Major Changes
+- Binary Linux wheels
+
+  Linux wheels won't be released to pypi for this version, due to incompatibility with
+  the h5py CI stack. In future releases, Linux wheels will introduce a strict upper pin
+  to the latest released version of h5py at the moment of publishing.
+
+  #### Past versions compatibility
+
+  | versioned-hdf5                      | h5py version compatibility |
+  |-------------------------------------|----------------------------|
+  | 2.2.0 Linux wheels                  | `h5py >=3.15.0,<=3.15.1`   |
+  | 2.2.1 Linux wheels                  | `h5py >=3.15.0,<=3.15.1`   |
+  | 2.1.0 Linux wheels                  | `h5py >=3.8.0,<3.15.0`     |
+  | MacOSX wheels (all versions)        | `h5py >=3.8.0`             |
+  | conda-forge packages (all versions) | `h5py >=3.8.0`             |
+  | Build from sources (all versions)   | `h5py >=3.8.0`             |
+
+### Minor Changes
+
+- Fix NumPy version parsing to account for local versions, e.g. `2.3.0+myvariant3`
+- Fix bug in `delete_versions` when the dataset is equal to fillvalue across all versions
+- Fix bug in `create_dataset` where dtype metadata for object strings would be discarded
+
+### Developers-only Changes
+
+- The development workflow has been migrated to Pixi. This allows for fully reproducible
+  builds between local environments and CI and makes dev deployment much easier.
+- Added support for editable installs (`pip install . --editable --no-build-isolation`)
+- The full unit tests suite now runs successfully on Windows and MacOS CI
+
 ## 2.2.1 (2026-01-07)
 
 Fix wheels publishing issue on Linux.
