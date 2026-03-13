@@ -10,6 +10,7 @@ jobs:
           - mindeps # Python 3.10, NumPy 1.24.4, libhdf5 1.10, h5py 3.8, ndindex 1.5.1,
           # pinned build stack
           - hdf5-112 # Python 3.10, NumPy 1.24.4, libhdf5 1.12, h5py 3.8, latest ndindex
+          - hdf5-210 # Python 3.14, libhdf5 2.1, latest versions of other dependencies
           - np126 # Python 3.10, NumPy 1.26, latest versions of other dependencies
           - np200 # Python 3.10, NumPy 2.0, latest versions of other dependencies
           # (Note: NumPy 2.0 has special cases not present in other versions)
@@ -39,6 +40,9 @@ jobs:
             env: py314
           - os: windows-latest # x64
             env: py314
+        exclude:
+          - os: windows-latest
+            env: hdf5-210  # Not supported by local pixi recipe
 
       fail-fast: false
     steps:
@@ -50,7 +54,7 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@v0
         with:
-          pixi-version: v0.63.2
+          pixi-version: v0.65.0
           cache: true
           locked: ${{ matrix.env != 'h5py-dev' }}
           environments: ${{ matrix.env }}

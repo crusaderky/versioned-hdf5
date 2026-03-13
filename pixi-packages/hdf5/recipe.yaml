@@ -1,0 +1,30 @@
+context:
+  version: "2.1.0"
+
+package:
+  name: hdf5
+  version: ${{ version }}
+
+source:
+  url: https://github.com/HDFGroup/hdf5/releases/download/2.1.0/hdf5-${{ version }}.tar.gz
+  sha256: ce7f5515a95d588b8606c3fb50643f8b88ac52ffbbde9c63bb1edca6a256e964
+
+build:
+  script:
+    file: build.sh
+
+requirements:
+  build:
+    - clang
+    - cmake
+    - ninja
+    - libaec  # for szip support
+    - zlib
+  run:
+    - libaec
+    - zlib
+
+about:
+  homepage: https://www.hdfgroup.org/solutions/hdf5/
+  license: BSD-3-Clause
+  license_family: BSD
