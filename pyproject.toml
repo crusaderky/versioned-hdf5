@@ -344,9 +344,12 @@ hdf5plugin = "*"
 
 [tool.pixi.feature.ipython.dependencies]
 ipython = "*"
+jupyterlab = "*"
+pyinstrument = "*"
 
 [tool.pixi.feature.ipython.tasks]
 ipython = { cmd = "ipython", depends-on = ["editable-install"] }
+jupyter = { cmd = "jupyter lab", depends-on = ["editable-install"] }
 
 [tool.pixi.feature.lint.dependencies]
 lefthook = "*"
