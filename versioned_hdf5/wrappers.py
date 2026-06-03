@@ -46,6 +46,22 @@ except ModuleNotFoundError:
 T = TypeVar("T")
 
 
+def _normalize_fill_value(fill_value: Any, dtype: DTypeLike) -> Any:
+    """Normalize the fill value before handing it to :class:`StagedChangesArray`.
+
+    Our object-dtype datasets are always variable-width strings. When no fill value is
+    set, ``StagedChangesArray`` (which is backend-agnostic) falls back to
+    ``np.zeros((), dtype)``, which for object dtype is the integer ``0`` rather than an
+    empty string -- a value that can neither be hashed nor written back to HDF5. Map a
+    missing (``None``) or zero fill of an object dtype to an empty byte string here, so
+    that ``StagedChangesArray`` only ever sees a regular string and needs no special
+    casing for it.
+    """
+    if np.dtype(dtype).kind == "O" and (fill_value is None or fill_value == 0):
+        return b""
+    return fill_value
+
+
 class InMemoryGroup(Group):
     _instances: ClassVar[WeakValueDictionary[h5g.GroupID, InMemoryGroup]] = (
         WeakValueDictionary({})
@@ -622,7 +638,7 @@ class InMemoryDataset(BufferMixin, FiltersMixin, Dataset):
             base_slabs=[self.id.raw_data],
             slab_indices=slab_indices,
             slab_offsets=slab_offsets,
-            fill_value=self.fillvalue,
+            fill_value=_normalize_fill_value(self.fillvalue, self.dtype),
         )
 
     @property
@@ -1046,7 +1062,7 @@ class InMemorySparseDataset(BufferMixin, FiltersMixin, DatasetLike):
             shape=shape,
             chunk_size=chunks,
             dtype=dtype,
-            fill_value=fillvalue,
+            fill_value=_normalize_fill_value(fillvalue, dtype),
         )
         # BufferMixin can later change self.staged_changes.dtype
         self.dtype = self.staged_changes.dtype
@@ -1223,7 +1239,9 @@ class DatasetWrapper(DatasetLike):
             # from dataset.dtype
             self.dataset._buffer,
             chunk_size=self.dataset.chunks,
-            fill_value=self.dataset.fillvalue,
+            fill_value=_normalize_fill_value(
+                self.dataset.fillvalue, self.dataset.dtype
+            ),
             as_base_slabs=False,
         )
         new_ds.resize(new_shape)

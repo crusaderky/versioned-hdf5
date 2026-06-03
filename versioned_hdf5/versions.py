@@ -11,6 +11,7 @@ from h5py import Dataset, Group
 
 from versioned_hdf5.backend import (
     Filters,
+    commit_staged_changes,
     create_virtual_dataset,
     write_dataset,
     write_dataset_chunks,
@@ -152,12 +153,11 @@ def commit_version(
                 for k, v in data.attrs.items():
                     data_copy.attrs[k] = v
                 continue
-            data = data.data_dict
-        if isinstance(data, dict):
-            if chunks[name] is not None:
-                raise NotImplementedError("Specifying chunk size with dict data")
-            slices = write_dataset_chunks(f, name, data)
+            # Commit the staged changes straight into raw_data + the on-disk hash table.
+            slices = commit_staged_changes(f, name, data.staged_changes)
         elif isinstance(data, InMemorySparseDataset):
+            shape = data.shape
+            # Create the (empty) raw_data + hash table, then commit into them.
             write_dataset(
                 f,
                 name,
@@ -166,7 +166,11 @@ def commit_version(
                 filters=filters[name],
                 fillvalue=fillvalue,
             )
-            slices = write_dataset_chunks(f, name, data.data_dict)
+            slices = commit_staged_changes(f, name, data.staged_changes)
+        elif isinstance(data, dict):
+            if chunks[name] is not None:
+                raise NotImplementedError("Specifying chunk size with dict data")
+            slices = write_dataset_chunks(f, name, data)
         else:
             if isinstance(data, InMemoryArrayDataset):
                 # If buffer has StringDType, avoid unnecessary conversion from outwardly
