@@ -17,6 +17,7 @@ from cython import bint, ssize_t
 from numpy.typing import ArrayLike, DTypeLike, NDArray
 
 from versioned_hdf5.cytools import ceil_a_over_b, count2stop, np_hsize_t
+from versioned_hdf5.hash import hash_slab
 from versioned_hdf5.slicetools import read_many_slices
 from versioned_hdf5.subchunk_map import (
     EntireChunksMapper,
@@ -34,6 +35,7 @@ if cython.compiled:  # pragma: nocover
         count2stop,
         hsize_t,
     )
+    from cython.cimports.versioned_hdf5.hash import hash_slab
     from cython.cimports.versioned_hdf5.subchunk_map import (  # type: ignore
         IndexChunkMapper,
         read_many_slices_params_nd,
@@ -155,6 +157,20 @@ class StagedChangesArray(MutableMapping[Any, T]):
     #: slabs[0] is never dereferenced.
     slabs: list[NDArray[T] | None]
 
+    #: List parallel to :attr:`slabs` (same length, None wherever ``slabs`` is None).
+    #: ``hash_tables[i]`` is a C-contiguous array of dtype ``hsize_t`` and shape
+    #: ``(n_i, 4)``, where ``n_i`` is the number of chunks in ``slabs[i]`` along axis 0,
+    #: and each row holds one SHA256 digest (4 * 8 = 32 bytes). ``hash_tables[i][j]`` is
+    #: the hash of the chunk at ``slabs[i][j*chunk_size[0]:(j+1)*chunk_size[0]]``.
+    #:
+    #: A row set to all-zeros means the hash is *uninitialised*. The hashes of staged
+    #: slabs are computed on demand by :meth:`commit`; until then they are left
+    #: uninitialised (they are recomputed at commit time regardless, so mutating methods
+    #: only keep the *length* of this list in sync with ``slabs``). The full slab's hash
+    #: (``hash_tables[0]``) is computed lazily by :meth:`_get_hash_table`; base slab
+    #: hashes are typically loaded from disk and passed to ``__init__``.
+    hash_tables: list[NDArray[np_hsize_t] | None]
+
     #: Number of base slabs in the slabs list.
     #: Staged slabs start at index n_base_slabs + 1.
     n_base_slabs: int
@@ -172,6 +188,7 @@ class StagedChangesArray(MutableMapping[Any, T]):
         slab_indices: ArrayLike,
         slab_offsets: ArrayLike,
         fill_value: Any | None = None,
+        base_hash_tables: Sequence[NDArray[np_hsize_t] | None] | None = None,
     ):
         # Sanitize input (e.g. convert np.int64 to int)
         shape = tuple(int(i) for i in shape)
@@ -215,6 +232,23 @@ class StagedChangesArray(MutableMapping[Any, T]):
         self.slabs = [np.broadcast_to(fill_value, chunk_size)]
         self.slabs.extend(base_slabs)
         self.n_base_slabs = len(base_slabs)
+
+        # Build the hash_tables list, parallel to slabs.
+        # hash_tables[0] (the full slab) is computed lazily by _get_hash_table().
+        self.hash_tables = [None]
+        for i, base_slab in enumerate(base_slabs):
+            n_i = int(ceil_a_over_b(base_slab.shape[0], chunk_size[0]))
+            if base_hash_tables is not None and base_hash_tables[i] is not None:
+                bht = np.ascontiguousarray(
+                    asarray(base_hash_tables[i], dtype=np_hsize_t)
+                )
+                if bht.shape != (n_i, 4):
+                    raise ValueError(
+                        f"base_hash_tables[{i}].shape={bht.shape}; expected {(n_i, 4)}"
+                    )
+                self.hash_tables.append(bht)
+            else:
+                self.hash_tables.append(np.zeros((n_i, 4), dtype=np_hsize_t))
 
         self.slab_indices = asarray(slab_indices, dtype=np_hsize_t)
         self.slab_offsets = asarray(slab_offsets, dtype=np_hsize_t)
@@ -430,6 +464,50 @@ class StagedChangesArray(MutableMapping[Any, T]):
             n_base_slabs=self.n_base_slabs,
         )
 
+    def _hash_plan(self) -> HashPlan:
+        """Formulate a plan to hash all staged chunks.
+
+        This is a read-only operation (it does not write to the hash tables; it just
+        computes the parameters for the hasher).
+        """
+        return HashPlan(
+            shape=self.shape,
+            chunk_size=self.chunk_size,
+            slab_indices=self.slab_indices,
+            slab_offsets=self.slab_offsets,
+            n_base_slabs=self.n_base_slabs,
+        )
+
+    def _commit_plan(self, hplan: HashPlan | None = None) -> CommitPlan:
+        """Formulate a plan to deduplicate and consolidate all staged chunks.
+
+        Unlike the other ``_*_plan`` factories, this populates the hash tables of the
+        staged slabs (and lazily the full slab) as a side effect; the plan needs them.
+        the hashes are derived data, so this is idempotent. It does not otherwise alter
+        the state of the StagedChangesArray (slab_indices/slab_offsets are copied).
+        """
+        if hplan is None:
+            hplan = self._hash_plan()
+            for slab_idx, (hash_rows, src_start, count) in hplan.hashes:
+                hash_slab(
+                    self._get_slab(slab_idx),
+                    self._get_hash_table(slab_idx),
+                    hash_rows,
+                    src_start,
+                    count,
+                )
+            self._get_hash_table(0)  # ensure the full slab's hash is available
+
+        return CommitPlan(
+            hplan,
+            slab_indices=self.slab_indices,
+            slab_offsets=self.slab_offsets,
+            hash_tables=self.hash_tables,
+            n_base_slabs=self.n_base_slabs,
+            n_slabs=self.n_slabs,
+            chunk_size=self.chunk_size,
+        )
+
     def _get_slab(
         self,
         idx: int | None,
@@ -468,6 +546,24 @@ class StagedChangesArray(MutableMapping[Any, T]):
                 self.slabs[idx] = slab
 
         return slab
+
+    def _get_hash_table(self, idx: int) -> NDArray[np_hsize_t]:
+        """Fetch the hash table for the slab at ``idx``.
+
+        The full slab's hash table (idx 0) is computed lazily here, as it depends on the
+        fill_value and dtype (both of which can change via refill()/astype()); it holds
+        the hash of a single chunk_size-shaped chunk full of fill_value. This is what
+        lets a staged chunk that turns out to be entirely fill_value be deduplicated to
+        the full slab, and thus not be written to disk at all.
+
+        All other entries are created eagerly alongside their slab.
+        """
+        ht = self.hash_tables[idx]
+        if ht is None:
+            # Only the full slab is computed lazily; dropped slabs are never requested.
+            ht = np.zeros((1, 4), dtype=np.uint64)
+            self.hash_tables[idx] = ht
+        return ht
 
     def changes(
         self,
@@ -533,6 +629,10 @@ class StagedChangesArray(MutableMapping[Any, T]):
         """Implement common workflow of __setitem__, resize, and load."""
         for shape in plan.append_slabs:
             self.slabs.append(np.empty(shape, dtype=self.dtype))
+            # Matching uninitialised hash table; staged hashes are recomputed at commit
+            self.hash_tables.append(
+                np.zeros((shape[0] // self.chunk_size[0], 4), dtype=np_hsize_t)
+            )
 
         for tplan in plan.transfers:
             src_slab = self._get_slab(tplan.src_slab_idx, default_slab)
@@ -546,6 +646,7 @@ class StagedChangesArray(MutableMapping[Any, T]):
         for slab_idx in plan.drop_slabs:
             assert slab_idx != 0  # Never drop the full slab
             self.slabs[slab_idx] = None
+            self.hash_tables[slab_idx] = None
 
         # Even if we pass the indices arrays by reference to the *Plan
         # constructors, they may nonetheless be copied internally.
@@ -619,6 +720,104 @@ class StagedChangesArray(MutableMapping[Any, T]):
         plan = self._load_plan(copy=False)
         self._apply_mutating_plan(plan)  # This may be a no-op
 
+    def commit(self, empty: Callable[..., MutableArrayProtocol] = np.empty) -> None:
+        """Consolidate all staged chunks into a single, brand new base slab.
+
+        This is the act of moving every chunk that lies on a staged slab to a new base
+        slab, deduplicating it along the way:
+
+        - against the other staged chunks (so identical staged chunks are stored once),
+        - against the existing base slabs (so a staged chunk identical to one already on
+          a base slab - e.g. the ``raw_data`` of an InMemoryDataset - becomes just a
+          reference to it and is not rewritten), and
+        - against the fill_value (so a full-sized chunk that turns out to be entirely
+          fill_value is dropped to the full slab and not written at all).
+
+        When the slab with the lowest index wins a tie, base slabs win over staged slabs
+        and the full slab wins over everything. *All* hashes are considered, even those
+        of base-slab chunks not currently referenced by any chunk, so that a chunk
+        committed two or more versions ago and since deleted - but still present in
+        ``raw_data`` - can be reused.
+
+        This is the inverse of :meth:`load`: where ``load`` copies the contents of the
+        base slabs into a new staged slab, ``commit`` copies the contents of the staged
+        slabs (those that survive deduplication) into a new base slab and then drops all
+        the staged slabs.
+
+        After this call there are exactly ``n_base_slabs + 2`` slabs: the full slab, the
+        original base slabs (any that are no longer referenced are replaced with None),
+        and the new base slab at index ``n_base_slabs + 1`` (the old ``n_base_slabs``).
+        There are no more staged slabs.
+
+        Parameters
+        ----------
+        empty:
+            Callable matching :func:`numpy.empty` (``empty(shape, dtype)``) that returns
+            the writeable destination for the new base slab. Defaults to
+            :func:`numpy.empty`. The InMemoryDataset wrapper instead passes a callable
+            that enlarges the ``raw_data`` hdf5 dataset and returns a view of the newly
+            created surface, so that the chunks are written straight to disk.
+        """
+        if not self.writeable:
+            raise ValueError("assignment destination is read-only")
+
+        # Stage 1 (HashPlan): hash all staged chunks (and the full slab) in place.
+        hplan = self._hash_plan()
+        for slab_idx, (hash_rows, src_start, count) in hplan.hashes:
+            hash_slab(
+                self._get_slab(slab_idx),
+                self._get_hash_table(slab_idx),
+                hash_rows,
+                src_start,
+                count,
+            )
+        self._get_hash_table(0)  # ensure the full slab's hash is available for dedup
+
+        # Stage 2 (CommitPlan): deduplicate, then plan the transfer to the new slab.
+        plan = CommitPlan(
+            hplan,
+            slab_indices=self.slab_indices,
+            slab_offsets=self.slab_offsets,
+            hash_tables=self.hash_tables,
+            n_base_slabs=self.n_base_slabs,
+            n_slabs=self.n_slabs,
+            chunk_size=self.chunk_size,
+        )
+
+        # Execute: create the new base slab and copy the surviving chunks into it.
+        # Reading from the staged slabs still uses their original indices here, as we
+        # only rebuild the slabs list afterwards.
+        new_slab = empty(plan.new_slab_shape, dtype=self.dtype)
+        for src_slab_idx, src_start, dst_start, count in plan.transfers:
+            read_many_slices(
+                self._get_slab(src_slab_idx),
+                new_slab,
+                src_start,
+                dst_start,
+                count,
+            )
+
+        # Rebuild slabs/hash_tables: [full slab] + base slabs + [new base slab],
+        # dropping every staged slab. The new base slab takes index n_base_slabs + 1.
+        b = self.n_base_slabs
+        new_slabs = self.slabs[: b + 1] + [new_slab]
+        new_hash_tables = self.hash_tables[: b + 1] + [plan.new_hash_table]
+
+        self.slab_indices = plan.slab_indices
+        self.slab_offsets = plan.slab_offsets
+
+        # Drop base slabs no longer referenced by any chunk (e.g. raw_data whose
+        # every chunk was overwritten); the full slab and the new base slab are kept.
+        referenced = set(np.unique(self.slab_indices).tolist())
+        for i in range(1, b + 1):
+            if i not in referenced:
+                new_slabs[i] = None
+                new_hash_tables[i] = None
+
+        self.slabs = new_slabs
+        self.hash_tables = new_hash_tables
+        self.n_base_slabs = b + 1
+
     def copy(self) -> StagedChangesArray[T]:
         """Return a writeable Copy-on-Write (CoW) copy of self.
 
@@ -635,6 +834,10 @@ class StagedChangesArray(MutableMapping[Any, T]):
 
         out = copy.copy(self)  # Shallow object copy
         out.slabs = self.slabs.copy()  # Shallow list copy
+        # Shallow list copy too. The arrays are shared: base/full slab hashes are
+        # immutable, and staged slab hashes are recomputed from scratch at commit time,
+        # so sharing the (possibly stale) staged entries across the CoW copy is safe.
+        out.hash_tables = self.hash_tables.copy()
         out.writeable = True  # Coherently with np.ndarray.copy()
         return out
 
@@ -683,11 +886,19 @@ class StagedChangesArray(MutableMapping[Any, T]):
                         f"base_slabs[{i}] mismatched shape: {new.shape} != {old.shape}"
                     )
                 out.slabs[i + 1] = new  # offset by the full slab at index 0
+                # The on-disk hashes were computed for the old dtype's bytes and are
+                # meaningless for the new one; reset to uninitialised (no dedup).
+                out.hash_tables[i + 1] = np.zeros(
+                    (int(ceil_a_over_b(new.shape[0], out.chunk_size[0])), 4),
+                    dtype=np_hsize_t,
+                )
 
         # Convert the full slab; this has to happen after calling out.load().
         out.slabs[0] = np.broadcast_to(
             asarray(out.fill_value, dtype=dtype), out.chunk_size
         )
+        # The full slab's hash depends on the dtype; force a lazy recompute.
+        out.hash_tables[0] = None
 
         # Leave the staged slabs as read-only views of the original slabs, with
         # original dtype. They will be converted lazily, upon first access, by
@@ -711,6 +922,7 @@ class StagedChangesArray(MutableMapping[Any, T]):
 
         out.load()
         out.slabs[0] = np.broadcast_to(fill_value, out.chunk_size)
+        out.hash_tables[0] = None  # full slab hash depends on the fill_value
         for idx, slab in enumerate(out.staged_slabs, start=out.staged_slabs_start):
             if slab is None:
                 continue
@@ -861,6 +1073,15 @@ class StagedChangesArray(MutableMapping[Any, T]):
                     slab = np.asarray(slab)
 
             out.slabs.append(slab)
+            # Uninitialised hash table, one row per chunk along axis 0. These slabs are
+            # not disk-backed so there are no precomputed hashes to load; staged-slab
+            # hashes are recomputed at commit time regardless.
+            out.hash_tables.append(
+                np.zeros(
+                    (int(ceil_a_over_b(slab.shape[0], chunk_size[0])), 4),
+                    dtype=np_hsize_t,
+                )
+            )
 
         if as_base_slabs:
             out.n_base_slabs = out.n_slabs - 1
@@ -1716,6 +1937,271 @@ class ResizePlan(MutatingPlan):
     @property
     def head(self) -> str:
         return "ResizePlan<" + super().head
+
+
+@cython.cclass
+@dataclass(init=False, repr=False)
+class HashPlan:
+    """Instructions to hash all staged chunks of a StagedChangesArray.
+
+    Finds every chunk that lies on a staged slab and, grouped by slab, produces the
+    ``(hash_rows, src_start, count)`` parameters for
+    :func:`versioned_hdf5.hash.hash_slab`.
+
+    The flattened query of staged chunks (with their edge-trimmed shapes) is retained
+    for reuse by :class:`CommitPlan`, which operates on exactly the same set of chunks.
+    """
+
+    #: One entry per staged slab: ``(slab_idx, (hash_rows, src_start, count))``,
+    #: each ready to be passed to :func:`versioned_hdf5.hash.hash_slab`.
+    hashes: list
+
+    #: ``_chunks_in_selection()`` output (idxidx=False), sorted by slab. One row per
+    #: staged chunk; columns ``[chunk_idx_0, ..., chunk_idx_{ndim-1}, slab_idx,
+    #: slab_offset]``.
+    query: NDArray[np_hsize_t]
+
+    #: ``(n_staged_chunks, ndim)`` edge-trimmed shape of each staged chunk, row-aligned
+    #: to :attr:`query`.
+    count: NDArray[np_hsize_t]
+
+    #: number of dimensions of the StagedChangesArray
+    ndim: int
+
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        chunk_size: tuple[int, ...],
+        slab_indices: NDArray[np_hsize_t],
+        slab_offsets: NDArray[np_hsize_t],
+        n_base_slabs: int,
+    ):
+        ndim = len(shape)
+        self.ndim = ndim
+        self.hashes = []
+
+        _, mappers = index_chunk_mappers((), shape, chunk_size)
+        if not mappers:
+            # size-0 array: no chunks at all
+            self.query = np.empty((0, ndim + 2), dtype=np_hsize_t)
+            self.count = np.empty((0, ndim), dtype=np_hsize_t)
+            return
+
+        query = np.asarray(
+            _chunks_in_selection(
+                slab_indices,
+                slab_offsets,
+                mappers,
+                filter=lambda slab_idx: slab_idx > n_base_slabs,
+                idxidx=False,
+                sort_by_slab=True,
+            )
+        )
+        self.query = query
+        nchunks = query.shape[0]
+
+        # Edge-trimmed shape of each chunk (chunk_size, except the last chunk along an
+        # axis, where it's the remainder). This makes an edge chunk hash like the
+        # smaller chunk it represents in the virtual array, never reading past its edge.
+        count = np.empty((nchunks, ndim), dtype=np_hsize_t)
+        for k in range(ndim):
+            n_chunks_k = int(ceil_a_over_b(shape[k], chunk_size[k]))
+            last_k = (shape[k] % chunk_size[k]) or chunk_size[k]
+            is_last = query[:, k] == (n_chunks_k - 1)
+            count[:, k] = np.where(is_last, last_k, chunk_size[k])
+        self.count = count
+
+        if nchunks == 0:
+            return
+
+        cs0 = chunk_size[0]
+        slab_idx_col = query[:, ndim]
+        slab_off_col = query[:, ndim + 1]
+        hash_rows = slab_off_col // cs0
+        src_start = slab_off_col.copy()
+
+        # The query is sorted by slab index; split it into per-slab groups.
+        split = np.flatnonzero(np.diff(slab_idx_col)) + 1
+        starts = [0, *split.tolist()]
+        stops = [*split.tolist(), nchunks]
+        for start, stop in zip(starts, stops, strict=True):
+            self.hashes.append(
+                (
+                    int(slab_idx_col[start]),
+                    (
+                        np.ascontiguousarray(hash_rows[start:stop]),
+                        np.ascontiguousarray(src_start[start:stop]),
+                        np.ascontiguousarray(count[start:stop]),
+                    ),
+                )
+            )
+
+    @property
+    def head(self) -> str:
+        return (
+            f"HashPlan<{self.query.shape[0]} staged chunks on {len(self.hashes)} slabs>"
+        )
+
+    def __repr__(self) -> str:
+        s = self.head
+        for slab_idx, (hash_rows, _, _) in self.hashes:
+            s += f"\n  hash {len(hash_rows)} chunks on slabs[{slab_idx}]"
+        return s
+
+
+@cython.cclass
+@dataclass(init=False, repr=False)
+class CommitPlan:
+    """Instructions to execute StagedChangesArray.commit().
+
+    Deduplicates the staged chunks against each other, the base slabs and the full slab,
+    then plans the transfer of the unique survivors into a single new base slab.
+    """
+
+    #: Updated metadata after deduplication. Survivors point at the new base slab (index
+    #: ``n_base_slabs + 1``); every other staged chunk points at whatever slab it
+    #: deduplicated to (a base slab, the full slab, or another staged chunk's survivor).
+    slab_indices: NDArray[np_hsize_t]
+    slab_offsets: NDArray[np_hsize_t]
+
+    #: Shape of the new base slab, to be created with the ``empty()`` callback.
+    new_slab_shape: tuple[int, ...]
+
+    #: Hash table for the new base slab; one row per surviving unique chunk.
+    new_hash_table: NDArray[np_hsize_t]
+
+    #: Chunk-block copies from staged slabs to the new base slab, grouped by src slab:
+    #: a list of ``(src_slab_idx, src_start, dst_start, count)``.
+    transfers: list
+
+    #: Index the new base slab will take in the slabs list (``n_base_slabs + 1``).
+    new_slab_idx: int
+
+    def __init__(
+        self,
+        hplan: HashPlan,
+        slab_indices: NDArray[np_hsize_t],
+        slab_offsets: NDArray[np_hsize_t],
+        hash_tables: list,
+        n_base_slabs: int,
+        n_slabs: int,
+        chunk_size: tuple[int, ...],
+    ):
+        cs0 = chunk_size[0]
+        ndim = hplan.ndim
+        new_slab_idx = n_base_slabs + 1
+        self.new_slab_idx = new_slab_idx
+
+        self.slab_indices = slab_indices.copy()
+        self.slab_offsets = slab_offsets.copy()
+
+        # 1. Build {hash -> (slab_idx, slab_offset)} from ALL hash tables. Iterating
+        #    slabs in ascending order makes the lowest slab win ties: the full slab (0)
+        #    beats the base slabs, which beat the staged slabs. Unreferenced base-slab
+        #    chunks are included too, so a chunk deleted versions ago but still present
+        #    in raw_data can be reused.
+        zero_hash = bytes(32)
+        hashmap: dict = {}
+        for i in range(n_slabs):
+            ht = hash_tables[i]
+            if ht is None:
+                continue
+            ht = np.ascontiguousarray(ht)
+            for j in range(ht.shape[0]):
+                key = ht[j].tobytes()
+                if key != zero_hash and key not in hashmap:
+                    hashmap[key] = (i, j * cs0)
+
+        query = hplan.query
+        count = hplan.count
+        nchunks = query.shape[0]
+
+        # 2. Deduplicate every staged chunk, collecting the unique survivors that still
+        #    need to be written to the new base slab. We assign offsets in the new base
+        #    slab in chunk-index (row-major) order, so the resulting raw_data layout
+        #    matches the legacy backend (it iterates chunks in that order). The winner
+        #    of a hash tie is still the lowest slab (so the *data* copied is identical),
+        #    but the *position* is decided by the first chunk to reference it.
+        new_offset_map: dict = {}  # (src_slab, src_offset) -> offset in new base slab
+        survivors = []  # (src_slab, src_offset, valid_shape, new_offset)
+        dst_slab_idx = np.empty(nchunks, dtype=np_hsize_t)
+        dst_slab_off = np.empty(nchunks, dtype=np_hsize_t)
+
+        # Row-major order over the chunk grid (chunk_idx_0 most significant).
+        order = (
+            np.lexsort(np.asarray(query[:, :ndim]).T[::-1])
+            if nchunks
+            else np.empty(0, dtype=np.intp)
+        )
+        for r in order:
+            cur_slab = int(query[r, ndim])
+            cur_off = int(query[r, ndim + 1])
+            key = hash_tables[cur_slab][cur_off // cs0].tobytes()
+            win_slab, win_off = hashmap[key]
+            if win_slab > n_base_slabs:
+                # Survives onto the new base slab (possibly shared with earlier chunks
+                # that hashed identically).
+                map_key = (win_slab, win_off)
+                if map_key not in new_offset_map:
+                    new_off = len(new_offset_map) * cs0
+                    new_offset_map[map_key] = new_off
+                    survivors.append((win_slab, win_off, count[r], new_off))
+                else:
+                    new_off = new_offset_map[map_key]
+                dst_slab_idx[r] = new_slab_idx
+                dst_slab_off[r] = new_off
+            else:
+                # Deduplicated onto the full slab or a base slab.
+                dst_slab_idx[r] = win_slab
+                dst_slab_off[r] = win_off
+
+        # Apply the new metadata at the (distinct) staged chunk positions.
+        chunk_idx = tuple(query[:, k] for k in range(ndim))
+        self.slab_indices[chunk_idx] = dst_slab_idx
+        self.slab_offsets[chunk_idx] = dst_slab_off
+
+        # 3. Size and hash the new base slab.
+        n_new = len(survivors)
+        self.new_slab_shape = (n_new * cs0, *chunk_size[1:])
+        self.new_hash_table = np.zeros((n_new, 4), dtype=np_hsize_t)
+        for win_slab, win_off, _, new_off in survivors:
+            self.new_hash_table[new_off // cs0] = hash_tables[win_slab][win_off // cs0]
+
+        # 4. Plan the transfer (chunk-block copies), grouped by source slab.
+        self.transfers = []
+        survivors.sort(key=lambda s: (s[0], s[1]))
+        for src_slab_idx, group in itertools.groupby(survivors, key=lambda s: s[0]):
+            members = list(group)
+            m = len(members)
+            src_start = np.zeros((m, ndim), dtype=np_hsize_t)
+            dst_start = np.zeros((m, ndim), dtype=np_hsize_t)
+            cnt = np.empty((m, ndim), dtype=np_hsize_t)
+            for t, (_, win_off, valid_shape, new_off) in enumerate(members):
+                src_start[t, 0] = win_off
+                dst_start[t, 0] = new_off
+                cnt[t, :] = valid_shape
+            self.transfers.append((int(src_slab_idx), src_start, dst_start, cnt))
+
+    @property
+    def head(self) -> str:
+        ntransfers = sum(src_start.shape[0] for _, src_start, _, _ in self.transfers)
+        return (
+            f"CommitPlan<new base slab slabs[{self.new_slab_idx}] "
+            f"shape={self.new_slab_shape}, {ntransfers} chunk transfers "
+            f"from {len(self.transfers)} slabs>"
+        )
+
+    def __repr__(self) -> str:
+        s = self.head
+        for src_slab_idx, src_start, dst_start, _ in self.transfers:
+            for t in range(src_start.shape[0]):
+                s += (
+                    f"\n  slabs[{self.new_slab_idx}][{int(dst_start[t, 0])}:] = "
+                    f"slabs[{src_slab_idx}][{int(src_start[t, 0])}:]"
+                )
+        s += f"\nslab_indices:\n{np.asarray(self.slab_indices)}"
+        s += f"\nslab_offsets:\n{np.asarray(self.slab_offsets)}"
+        return s
 
 
 @cython.ccall
