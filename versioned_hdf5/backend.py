@@ -15,12 +15,15 @@ from h5py._hl.selections import select
 from h5py._selector import Selector
 from ndindex import ChunkSize, Slice, Tuple, ndindex
 from numpy.testing import assert_array_equal
+from numpy.typing import ArrayLike, DTypeLike
 
-from versioned_hdf5.h5py_compat import HAS_NPYSTRINGS
+from versioned_hdf5.cytools import np_hsize_t
+from versioned_hdf5.h5py_compat import HAS_NPYSTRINGS, h5py_astype
 from versioned_hdf5.hashtable import Hashtable
 from versioned_hdf5.typing_ import DEFAULT, Default
 
 if TYPE_CHECKING:
+    from versioned_hdf5.staged_changes import StagedChangesArray
     from versioned_hdf5.wrappers import FiltersMixin
 
 DEFAULT_CHUNK_SIZE = 2**12
@@ -550,6 +553,177 @@ def write_dataset_chunks(f, name, data_dict):
         new_chunks - old_chunks,
         chunks_reused,
     )
+
+    return slices
+
+
+class _RawDataView:
+    """A thin, 0-based, writeable window onto ``raw_data[offset:]``.
+
+    :func:`commit_staged_changes` hands this to ``StagedChangesArray.commit`` as the
+    ``empty`` callback's return value, so that the surviving staged chunks are written
+    straight into the (already enlarged) ``raw_data`` hdf5 dataset by
+    :func:`~versioned_hdf5.slicetools.read_many_slices`, instead of into a throwaway
+    numpy buffer. Only the slow (generic) read_many_slices path is exercised, which just
+    needs ``__setitem__`` plus the ``dtype``/``ndim``/``shape``/``size`` attributes.
+    """
+
+    def __init__(self, raw_data: Dataset, offset: int, dtype: np.dtype):
+        self._raw_data = raw_data
+        self._offset = offset
+        # The committing dtype, which may differ from raw_data.dtype for variable-width
+        # strings (e.g. StringDType staged slabs vs an object-dtype raw_data). It must
+        # match the source slabs for read_many_slices; the h5py write in __setitem__
+        # then converts to raw_data.dtype, exactly as the legacy backend did.
+        self.dtype = dtype
+        self.ndim = raw_data.ndim
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        rd = self._raw_data.shape
+        return (rd[0] - self._offset,) + rd[1:]
+
+    @property
+    def size(self) -> int:
+        return int(np.prod(self.shape))
+
+    def _shift(self, idx: Any) -> tuple:
+        # read_many_slices' slow path always indexes with a tuple of slices; shift the
+        # leading axis by the offset so this view is 0-based.
+        if not isinstance(idx, tuple):
+            idx = (idx,)
+        first = idx[0]
+        first = slice(first.start + self._offset, first.stop + self._offset, first.step)
+        return (first, *idx[1:])
+
+    def __setitem__(self, idx: Any, value: ArrayLike) -> None:
+        self._raw_data[self._shift(idx)] = value
+
+    def __getitem__(self, idx: Any) -> np.ndarray:
+        return self._raw_data[self._shift(idx)]
+
+    def __array__(
+        self, dtype: DTypeLike | None = None, copy: bool | None = None
+    ) -> np.ndarray:
+        return np.asarray(self._raw_data[self._offset :], dtype=dtype)
+
+
+def _invert_hashtable(f, name: str, n_rows: int, chunk_size0: int) -> np.ndarray:
+    """Load the legacy on-disk ``{sha256: raw_data slice}`` table and invert it into
+    the position-indexed ``(n_rows, 4)`` layout that StagedChangesArray.hash_tables uses
+    for the ``raw_data`` base slab: row ``slice.start // chunk_size[0]`` holds the hash.
+
+    All entries are loaded, even of chunks no longer referenced by any version, so that
+    a chunk deleted versions ago but still present in raw_data can be reused.
+    """
+    out = np.zeros((n_rows, 4), dtype=np_hsize_t)
+    # Read-only: do not use the context manager, which would write the table back.
+    hashtable = Hashtable(f, name)
+    for key in hashtable:
+        start = hashtable[key].start
+        out[start // chunk_size0] = np.frombuffer(key, dtype=np_hsize_t)
+    return out
+
+
+def commit_staged_changes(
+    f, name: str, staged_changes: StagedChangesArray
+) -> dict[Tuple, Slice]:
+    """Commit a StagedChangesArray into ``raw_data`` and the on-disk hash table.
+
+    This is the new replacement for the ``data_dict`` -> :func:`write_dataset_chunks`
+    path for InMemoryDataset and InMemorySparseDataset. It:
+
+    1. populates the base slab's in-memory hash table by inverting the on-disk one, so
+       that staged chunks can be deduplicated against those already in ``raw_data``;
+    2. calls :meth:`~versioned_hdf5.staged_changes.StagedChangesArray.commit`, enlarging
+       ``raw_data`` and writing the surviving (deduplicated) staged chunks straight into
+       the new surface;
+    3. records the new chunks' hashes in the on-disk hash table (legacy format, so
+       :mod:`~versioned_hdf5.replay` and existing files keep working); and
+    4. returns the ``{chunk_index: raw_data slice}`` mapping for
+       :func:`create_virtual_dataset`.
+
+    ``raw_data`` (and its hash table) must already exist; the caller creates them for a
+    brand new InMemorySparseDataset via :func:`write_dataset` with an empty array.
+    """
+    sc = staged_changes
+    raw_data = f["_version_data"][name]["raw_data"]
+    chunk_size0 = sc.chunk_size[0]
+
+    # New chunks are appended at the end of the *used* portion of raw_data, which is
+    # largest_index * chunk_size[0] - not raw_data.shape[0], which may be over-allocated
+    # (e.g. write_dataset() rounds an empty dataset up to one chunk), keeping raw_data
+    # packed and identical to the legacy backend's layout, which replay relies on.
+    prev_len = int(Hashtable(f, name).largest_index) * chunk_size0
+
+    # 1. Deduplicate against everything already in raw_data (referenced or not).
+    if sc.n_base_slabs >= 1:
+        if sc.slabs[1] is None:
+            # The base slab was dereferenced (e.g. by a shrinking resize), but raw_data
+            # is still on disk and its chunks remain reusable; re-attach it for dedup.
+            sc.slabs[1] = raw_data
+        base_slab = sc.slabs[1]
+        assert base_slab is not None
+        n_rows = base_slab.shape[0] // chunk_size0
+        sc.hash_tables[1] = _invert_hashtable(f, name, n_rows, chunk_size0)
+
+    def _empty(shape: tuple[int, ...], dtype) -> _RawDataView:
+        # Grow only: never shrink raw_data, both because new chunks are written from
+        # prev_len (which may be below an over-allocated end) and because callers may
+        # rely on the allocated size being retained.
+        new_len = max(raw_data.shape[0], prev_len + shape[0])
+        raw_data.resize((new_len,) + raw_data.shape[1:])
+        return _RawDataView(raw_data, prev_len, dtype)
+
+    # 2. Move surviving staged chunks into the freshly grown raw_data surface.
+    sc.commit(empty=_empty)
+
+    # 3. Shift the new chunks' offsets from view-relative to absolute raw_data offsets,
+    #    so that every non-full chunk's slab_offset is its actual position in raw_data.
+    new_idx = sc.n_base_slabs
+    sc.slab_offsets[np.asarray(sc.slab_indices) == new_idx] += prev_len
+
+    # 4. Build the slices dict for create_virtual_dataset, and collect each *unique* new
+    #    chunk's slice (keyed by its row in the new base slab; many virtual chunks may
+    #    reference the same deduplicated new chunk).
+    new_hash_table = sc.hash_tables[new_idx]
+    assert new_hash_table is not None
+    slices: dict[Tuple, Slice] = {}
+    new_chunk_slices: dict[int, Slice] = {}
+    for base_slice, slab_idx, slab_slice in sc._changes_plan().chunks:
+        start = int(slab_slice[0].start)
+        stop = int(slab_slice[0].stop)
+        sl = Slice(start, stop)
+        slices[Tuple(*base_slice)] = sl
+        if slab_idx == new_idx:
+            new_chunk_slices[(start - prev_len) // chunk_size0] = sl
+
+    # Record the new chunks' hashes in the on-disk hash table (legacy format). Each hash
+    # is brand new (anything already in raw_data was deduplicated against in step 1) and
+    # is written exactly once.
+    with Hashtable(f, name) as hashtable:
+        for row, sl in new_chunk_slices.items():
+            hashtable[new_hash_table[row].tobytes()] = sl
+
+    # 5. Consolidate the committed array down to a single raw_data base slab, so that it
+    #    is structurally identical to a freshly-loaded InMemoryDataset. It gets cached
+    #    by the wrapper and read/astyped again before being discarded, and those
+    #    code paths assume exactly one base slab. Both the original base slab and
+    #    the new base slab are raw_data with absolute offsets, so they merge cleanly.
+    #
+    #    For variable-width strings the committing dtype (e.g. StringDType) differs from
+    #    raw_data's (object), so present raw_data through a lazy astype view, mirroring
+    #    what InMemoryDataset does when it first builds its StagedChangesArray.
+    base_slab = raw_data
+    if sc.dtype != raw_data.dtype:
+        base_slab = h5py_astype(raw_data, sc.dtype)
+    sc.slab_indices[np.asarray(sc.slab_indices) == new_idx] = 1
+    sc.slabs = [sc.slabs[0], base_slab]
+    sc.hash_tables = [
+        sc.hash_tables[0],
+        np.zeros((raw_data.shape[0] // chunk_size0, 4), dtype=np_hsize_t),
+    ]
+    sc.n_base_slabs = 1
 
     return slices
 
