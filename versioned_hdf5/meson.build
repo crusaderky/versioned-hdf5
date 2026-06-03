@@ -85,4 +85,15 @@ py.extension_module(
     subdir: 'versioned_hdf5',
     dependencies: compiled_deps,
     cython_args: cython_args,
+    include_directories: [npy_include_path],    
+)
+
+py.extension_module(
+    'hash',
+    ['hash.pyx', 'sha256.c'],
+    install: true,
+    subdir: 'versioned_hdf5',
+    dependencies: compiled_deps,
+    cython_args: cython_args,
+    include_directories: [npy_include_path],
 )
