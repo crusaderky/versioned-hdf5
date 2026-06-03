@@ -23,7 +23,10 @@ The list of slabs is made of three parts:
   be missing for a dataset that's completely empty.
 - The *staged slabs* are writeable numpy arrays that are created automatically by
   the ``StagedChangesArray`` whenever there is need to modify a chunk that lies on
-  either the full slab or a base slab.
+  either the full slab or a base slab. They are initialised to the fill_value, so that
+  the cells of an edge chunk that lie beyond the array boundary hold the fill_value
+  rather than uninitialised memory; this keeps the layout deterministic when
+  ``commit()`` later copies whole chunks (padding included) onto a base slab.
 
 Two numpy arrays of metadata are used to keep track of the chunks:
 
@@ -50,6 +53,22 @@ e.g.::
   slabs[1][30:40]  slabs[1][10:20]  slabs[0][0:10]*
   slabs[0][ 0:10]* slabs[2][20:30]  slabs[0][0:10]*
   slabs[0][ 0:10]* slabs[2][10:20]  slabs[0][0:10]*
+
+In addition to the slabs, the ``StagedChangesArray`` holds a ``hash_tables`` list which
+is kept exactly parallel to ``slabs`` (same length; ``None`` wherever the matching slab
+is ``None``). ``hash_tables[i]`` is a C-contiguous array of ``hsize_t`` and shape
+``(n, 4)``, where n is the number of chunks in ``slabs[i]`` along axis 0; each row holds
+one SHA256 digest (4*8 = 32 bytes), so that ``hash_tables[i][j]`` is the hash of the
+chunk at ``slabs[i][j*chunk_size[0]:(j+1)*chunk_size[0]]``. A row of all zeros means the
+hash is *uninitialised*.
+
+These hashes mirror those of :class:`versioned_hdf5.hashtable.Hashtable` and are used by
+:meth:`~versioned_hdf5.staged_changes.StagedChangesArray.commit` to deduplicate chunks.
+The hashes of the staged slabs are computed on demand at commit time (so the mutating
+methods only need to keep the *length* of ``hash_tables`` in sync with ``slabs``); the
+full slab's hash is computed lazily; and the base slab hashes are typically loaded from
+disk. New requirement of this scheme: base slabs must be aligned to ``chunk_size[0]``,
+which the ``raw_data`` dataset always is.
 
 In order to be performant, operations are chained together in a way that minimizes
 Python interaction and is heavily optimized with Cython. To this extent, each user
@@ -91,11 +110,15 @@ The source array-like can be either:
 - the full slab (a broadcasted numpy array);
 - the value parameter of the ``__setitem__`` method.
 
-The destination array (always an actual ``numpy.ndarray``) can be either:
+The destination array can be either:
 
-- a staged slab, shifted by ``slab_offsets``;
+- a staged slab (a numpy array in memory), shifted by ``slab_offsets``;
 - the return value of the ``__getitem__`` method, which is created empty at the
-  beginning of the method call and then progressively filled slice by slice.
+  beginning of the method call and then progressively filled slice by slice;
+- the new base slab created by ``commit()``: whatever its ``empty`` callback returns -
+  a plain ``numpy.ndarray`` by default, or any writeable numpy-like write surface (e.g.
+  ``InMemoryDataset`` hands in a thin view onto the ``raw_data`` hdf5 dataset, so that
+  committed chunks are written straight to disk).
 
 
 Plans
@@ -124,8 +147,8 @@ where ``dset`` is a staged versioned_hdf5 dataset, you can run::
 
     SetItemPlan<value_shape=(3, 3), value_view=[:, :], append 2 empty slabs,
     7 slice transfers among 3 slab pairs, drop 0 slabs>
-      slabs.append(np.empty((6, 2)))  # slabs[2]
-      slabs.append(np.empty((2, 2)))  # slabs[3]
+      slabs.append(empty((6, 2)))  # slabs[2]
+      slabs.append(empty((2, 2)))  # slabs[3]
       # 3 transfers from slabs[1] to slabs[2]
       slabs[2][0:2, 0:2] = slabs[1][10:12, 0:2]
       slabs[2][2:4, 0:2] = slabs[1][18:20, 0:2]
@@ -318,6 +341,70 @@ selects all chunks in that lie on a base slab and transfers them to a brand new 
 slab.
 
 
+``commit()`` algorithm
+----------------------
+To *commit* is to take all the chunks that lie on staged slabs and move them to a single
+brand new base slab, deduplicating them along the way. It is the inverse of ``load()``:
+where ``load()`` copies the base slabs into a new staged slab, ``commit()`` copies the
+(surviving) staged slabs into a new base slab and then drops all the staged slabs.
+
+A new base slab is appended *only if at least one staged chunk survives deduplication*.
+If every staged chunk turns out to be a duplicate of a base or full chunk (or there are
+no staged chunks at all), nothing is written: no new base slab is created and
+``n_base_slabs`` is left unchanged; the staged chunks are simply repointed to their
+duplicates before the staged slabs are dropped.
+
+When a new base slab is needed, it is allocated by an ``empty`` callback that replicates
+the API of ``numpy.empty``. The default is ``numpy.empty`` itself; ``InMemoryDataset``
+instead passes a callback that enlarges the ``raw_data`` hdf5 dataset and returns a thin
+view onto the newly created surface, so that the chunks are written straight to disk.
+
+Committing is broken down into two stages, ``HashPlan`` followed by ``CommitPlan``.
+
+**HashPlan** finds all the staged chunks (the same selection ``load()`` would make, but
+for staged rather than base slabs) and, grouped by slab, produces the parameters for the
+cythonized vectorized SHA256 hasher in :mod:`versioned_hdf5.hash`. The hasher has an API
+deliberately close to ``read_many_slices``: it is given a slab, its hash table, and, per
+chunk, the row to write to plus the start and (edge-trimmed) count of the chunk. It then
+hashes each chunk as if it were C-contiguous — exactly as
+:meth:`versioned_hdf5.hashtable.Hashtable.hash` does, so the digests are bit-for-bit
+identical — populating ``hash_tables`` for every staged chunk, without ever reading the
+uninitialised memory that may sit past the edge of an edge chunk. The query of staged
+chunks is retained and reused by the ``CommitPlan``.
+
+**CommitPlan** takes the whole ``hash_tables`` list and:
+
+1. compiles a hashmap of ``{hash: (slab index, slab offset)}``, scanning *all* the hash
+   tables. The slab with the lowest index wins a tie, which means that a chunk that is
+   really full of fill_value collapses onto the full slab (and is never written), and a
+   staged chunk identical to one already on a base slab becomes just a reference to it.
+   *All* hashes are parsed, not just those currently referenced by a chunk, so that a
+   chunk committed two or more versions ago and since deleted - but still present in
+   ``raw_data`` - can be reused;
+2. rewrites ``slab_indices`` and ``slab_offsets`` for every staged chunk to whatever the
+   hashmap says, deduplicating the staged chunks among themselves and against the base
+   and full slabs;
+3. re-scans the staged chunks that survived deduplication and, if there are any, compiles
+   a transfer (the inverse of ``LoadPlan``'s) that copies them — whole chunks, including
+   the fill_value padding past the edge of edge chunks — packed and in chunk-index order,
+   into a single new base slab. ``CommitPlan`` also produces the new ``hash_tables`` entry
+   for that slab, unlike the other plans which merely instruct the ``StagedChangesArray``
+   to append an uninitialised one. If no staged chunk survives deduplication, no new base
+   slab is appended.
+
+Finally the staged slabs are dropped, and any base slab no longer referenced by any
+chunk is dereferenced.
+
+**From ``InMemoryDataset``'s point of view**, the new base slab is the extension of the
+``raw_data`` hdf5 dataset. The on-disk hash table is kept in its legacy
+``{hash: raw_data slice}`` format (so :mod:`versioned_hdf5.replay`, the
+:class:`~versioned_hdf5.hashtable.Hashtable` reader, and existing files keep working): on
+the way in it is inverted into the position-indexed ``hash_tables`` layout for the
+``raw_data`` base slab, and on the way out the surviving new chunks' hashes are converted
+back to ``{hash: slice}`` entries. See
+:func:`versioned_hdf5.backend.commit_staged_changes`.
+
+
 Reclaiming memory
 -----------------
 Each plan that mutates the state - ``SetItemPlan``, ``ResizePlan``, and ``LoadPlan`` -
@@ -394,7 +481,7 @@ API interaction
 
           StagedChangesArray;
           Plans [
-              label="GetItemPlan\nSetItemPlan\nResizePlan\nLoadPlan\nChangesPlan";
+              label="GetItemPlan\nSetItemPlan\nResizePlan\nLoadPlan\nChangesPlan\nHashPlan\nCommitPlan";
           ]
 
           StagedChangesArray -> Plans -> TransferPlan;
@@ -416,9 +503,18 @@ API interaction
           read_many_slices -> hdf5_c;
       }
 
+      subgraph cluster_5 {
+          label="hash.pyx";
+          hash_slab;
+          openssl [label="libcrypto / OpenSSL EVP"];
+          hash_slab -> openssl;
+      }
+
       subgraph cluster_4 {
-          label="versions.py";
+          label="versions.py + backend.py";
           commit_version;
+          commit_staged_changes;
+          commit_version -> commit_staged_changes;
       }
 
       user -> DatasetWrapper;
@@ -429,10 +525,12 @@ API interaction
       Plans -> IndexChunkMapper;
       TransferPlan -> read_many_slices;
       TransferPlan -> read_many_slices_param_nd;
+      StagedChangesArray -> hash_slab;
 
       InMemorySparseDataset -> commit_version;
       InMemoryArrayDataset -> commit_version;
       InMemoryDataset -> commit_version;
+      commit_staged_changes -> StagedChangesArray;
 
       h5py;
       commit_version -> h5py;
