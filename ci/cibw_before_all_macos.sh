@@ -12,8 +12,15 @@ export HDF5_VERSION="2.0.0"
 export HDF5_DIR="$PROJECT_PATH/cache/hdf5/$HDF5_VERSION-$ARCH"
 source $PROJECT_PATH/ci/get_hdf5_if_needed.sh
 
+# libcrypto (OpenSSL) for versioned_hdf5/hash.pyx. The GitHub macOS runners ship
+# openssl@3 via Homebrew; install it if missing. delocate vendors libcrypto into the
+# wheel during the repair step, so the wheel stays self-contained.
+brew install openssl@3 || true
+export OPENSSL_DIR="$(brew --prefix openssl@3)"
+
 if [[ "$GITHUB_ENV" != "" ]]; then
     echo "HDF5_DIR=$HDF5_DIR" | tee -a $GITHUB_ENV
+    echo "OPENSSL_DIR=$OPENSSL_DIR" | tee -a $GITHUB_ENV
     echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" | tee -a $GITHUB_ENV
     echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" | tee -a $GITHUB_ENV
 fi

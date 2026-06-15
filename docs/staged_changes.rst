@@ -491,8 +491,8 @@ API interaction
       subgraph cluster_5 {
           label="hash.pyx";
           hash_slab;
-          sha256c [label="sha256.c (vendored)"];
-          hash_slab -> sha256c;
+          openssl [label="libcrypto / OpenSSL EVP"];
+          hash_slab -> openssl;
       }
 
       subgraph cluster_4 {
