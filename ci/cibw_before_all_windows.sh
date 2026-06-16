@@ -56,17 +56,41 @@ cp -r "$OPENSSL_SRC/include" "$OPENSSL_DIR/"
 cp -r "$OPENSSL_SRC/lib" "$OPENSSL_DIR/"
 cp -r "$OPENSSL_SRC/bin" "$OPENSSL_DIR/"
 
+# Locate the libcrypto import library. slproweb's layout has changed across OpenSSL
+# releases: older builds put libcrypto.lib directly under lib/, newer ones (3.5+/4.x)
+# put it under lib/VC/x64/MD/. Prefer the MD (dynamically-linked CRT) variant to match
+# the Python and HDF5 builds; never pick the *_static variant.
+echo "OpenSSL .lib files found:"
+find "$OPENSSL_DIR/lib" -iname '*.lib' | sort
+LIBCRYPTO_LIB=""
+for cand in \
+    "$OPENSSL_DIR/lib/VC/x64/MD/libcrypto.lib" \
+    "$OPENSSL_DIR/lib/VC/x64/MD/libcrypto64MD.lib" \
+    "$OPENSSL_DIR/lib/libcrypto.lib" ; do
+    if [[ -f "$cand" ]]; then LIBCRYPTO_LIB="$cand"; break; fi
+done
+if [[ "$LIBCRYPTO_LIB" == "" ]]; then
+    LIBCRYPTO_LIB=$(find "$OPENSSL_DIR/lib" -iname 'libcrypto*.lib' ! -iname '*static*' | head -1)
+fi
+if [[ "$LIBCRYPTO_LIB" == "" ]]; then
+    echo "Could not find the libcrypto import library under $OPENSSL_DIR/lib" >&2
+    exit 1
+fi
+echo "Using libcrypto import library: $LIBCRYPTO_LIB"
+LIBCRYPTO_NAME=$(basename "$LIBCRYPTO_LIB" .lib)               # e.g. libcrypto / libcrypto64MD
+LIBCRYPTO_LIBDIR_WIN=$(cygpath -m "$(dirname "$LIBCRYPTO_LIB")")
+
 OPENSSL_WIN=$(cygpath -m "$OPENSSL_DIR")  # forward-slash Windows path, no spaces
 mkdir -p "$OPENSSL_DIR/lib/pkgconfig"
 cat > "$OPENSSL_DIR/lib/pkgconfig/libcrypto.pc" <<EOF
 prefix=$OPENSSL_WIN
-libdir=\${prefix}/lib
+libdir=$LIBCRYPTO_LIBDIR_WIN
 includedir=\${prefix}/include
 
 Name: OpenSSL-libcrypto
 Description: OpenSSL cryptography library
 Version: 3.0.0
-Libs: -L\${libdir} -llibcrypto
+Libs: -L\${libdir} -l$LIBCRYPTO_NAME
 Cflags: -I\${includedir}
 EOF
 cat > "$OPENSSL_DIR/lib/pkgconfig/openssl.pc" <<EOF
