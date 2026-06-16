@@ -116,11 +116,11 @@ jobs:
         run: |
           cd wheelhouse
           unzip ./*.whl '*/RECORD'
-          echo "Removing lines:"
           # Drop RECORD entries for the libs we deleted above, but keep libcrypto.
-          sed -n '/^h5py/{/libcrypto/!p}' ./*/RECORD
-          # No sed -i available on MacOS
-          sed '/^h5py/{/libcrypto/!d;}' ./*/RECORD > RECORD.new
+          # awk (not sed) for portability between GNU (Linux) and BSD (macOS).
+          echo "Removing lines:"
+          awk '/^h5py/ && !/libcrypto/' ./*/RECORD
+          awk '!(/^h5py/ && !/libcrypto/)' ./*/RECORD > RECORD.new
           mv -v RECORD.new ./*/RECORD
           zip ./*.whl ./*/RECORD
 

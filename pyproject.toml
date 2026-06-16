@@ -180,10 +180,18 @@ CPATH = "$HDF5_DIR/include:$OPENSSL_DIR/include:$CPATH"
 PKG_CONFIG_PATH = "$HDF5_DIR/lib/pkgconfig:$OPENSSL_DIR/lib/pkgconfig:$PKG_CONFIG_PATH"
 
 [tool.cibuildwheel.windows]
+# delvewheel vendors libcrypto (OpenSSL) into the wheel so it stays self-contained;
+# h5py does NOT ship libcrypto. hdf5/hdf5_hl are excluded because, like on Linux/macOS,
+# they are provided at runtime by the installed h5py, which prepends its own package
+# directory to the DLL search path (os.add_dll_directory) when imported.
+# NB: the repaired wheel must be written to {dest_dir}; the previous `mv {wheel}` shipped
+# the *unrepaired* wheel, so nothing was ever vendored.
 repair-wheel-command = """ \
 pip install delvewheel && \
-delvewheel repair -v {wheel} && \
-mv -v {wheel} {dest_dir}
+delvewheel repair -v -w {dest_dir} \
+--add-path \"$OPENSSL_DIR/bin\" \
+--exclude hdf5.dll --exclude hdf5_hl.dll \
+{wheel} \
 """
 
 [tool.cibuildwheel.windows.environment]

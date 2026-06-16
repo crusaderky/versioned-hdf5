@@ -67,7 +67,9 @@ jobs:
           - macos-15-intel
           - macos-latest
           - windows-2022
-        python-version: ["3.12"] # TEMP: narrowed for libcrypto wheel debugging; restore full list
+        python-version: [
+          "3.12",
+        ] # TEMP: narrowed for libcrypto wheel debugging; restore full list
         include:
           - os: ubuntu-latest
             arch: x86_64
