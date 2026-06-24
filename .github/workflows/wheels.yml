@@ -77,7 +77,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $pkgs = @('pkgconfiglite', 'llvm')
+          $pkgs = @('pkgconfiglite', 'llvm', 'openssl')
           $max = 5
           for ($i = 1; $i -le $max; $i++) {
             Write-Host "::group::choco install attempt $i/$max"
