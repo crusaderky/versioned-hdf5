@@ -123,15 +123,15 @@ def test_build_slab_indices_and_offsets_sparse(h5file):
     expect[1, 3] = 456
     expect[2, 0] = 789
     np.testing.assert_array_equal(virt_dset[:], expect, strict=True)
+    # The StagedChangesArray.commit() path packs raw_data exactly: one chunk for each
+    # of the two modified chunks, with no spurious extra chunk (which the legacy backend
+    # used to leave behind - see the now-fixed FIXME at
+    # https://github.com/deshaw/versioned-hdf5/pull/385#discussion_r1817313138).
     expect_raw = np.array(
         [
             [123, 123, 123],
             [456, 123, 123],
             [789, 123, 123],
-            [123, 123, 123],
-            # FIXME Spurious extra chunk. Discussion:
-            # https://github.com/deshaw/versioned-hdf5/pull/385#discussion_r1817313138
-            [123, 123, 123],
             [123, 123, 123],
         ],
         dtype=np.int64,
