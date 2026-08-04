@@ -15,6 +15,7 @@ from versioned_hdf5.backend import (
     create_virtual_dataset,
     write_dataset,
 )
+from versioned_hdf5.staged_changes import StagedChangesArray
 from versioned_hdf5.wrappers import (
     DatasetWrapper,
     InMemoryArrayDataset,
@@ -157,18 +158,34 @@ def commit_version(
             write_dataset(
                 f,
                 name,
-                np.empty((0,) * len(data.shape), dtype=data._buffer.dtype),
+                np.empty((0,) * data.ndim, dtype=data._buffer.dtype),
                 chunks=chunks[name],
                 filters=filters[name],
                 fillvalue=fillvalue,
             )
             slices = commit_staged_changes(f, name, data.staged_changes)
-        else:
-            if isinstance(data, InMemoryArrayDataset):
-                # If buffer has StringDType, avoid unnecessary conversion from outwardly
-                # presented object dtype.
-                data = data._buffer
+        elif isinstance(data, InMemoryArrayDataset):
+            # InMemoryArrayDataset could be either a new dense dataset
+            # or DatasetWrapper performing a hotswap of its inner dataset
+            if f"_version_data/{name}/raw_data" not in f:
+                # Create the (empty) raw_data + hash table
+                write_dataset(
+                    f,
+                    name,
+                    np.empty((0,) * data.ndim, dtype=data._buffer.dtype),
+                    chunks=chunks[name],
+                    filters=filters[name],
+                    fillvalue=fillvalue,
+                )
 
+            staged_changes = StagedChangesArray.from_array(
+                data._buffer,
+                chunk_size=data.chunks or data.shape,
+                fill_value=fillvalue,
+                as_base_slabs=False,
+            )
+            slices = commit_staged_changes(f, name, staged_changes)
+        else:
             assert isinstance(data, np.ndarray)
             slices = write_dataset(
                 f,
