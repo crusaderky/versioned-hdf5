@@ -953,3 +953,67 @@ def test_commit_staged_changes_out_of_order_hashtable(vfile):
     raw_data, hash_table = _raw_data_hashtable(vfile, "x")
     assert raw_data.shape == (4,)  # No new chunk was written
     assert hash_table.attrs["largest_index"] == 2
+
+
+def test_create_virtual_dataset_plain_slices(h5file):
+    """create_virtual_dataset also accepts the plain-slice format
+    {tuple[slice, ...]: slice} produced by commit_staged_changes."""
+    data1 = np.ones((2 * DEFAULT_CHUNK_SIZE,))
+    chunksize = guess_chunk(data1.shape, None, data1.dtype.itemsize)[0]
+
+    with h5file as f:
+        f["_version_data/versions"].create_group("test_version")
+        slices1 = write_dataset(f, "test_data", data1)
+
+        # Convert the legacy {ndindex.Tuple: ndindex.Slice} dict to the plain format
+        plain = {tuple(s.raw for s in c.args): s0.raw for c, s0 in slices1.items()}
+
+        virtual_data = create_virtual_dataset(
+            f,
+            "test_version",
+            "test_data",
+            (2 * DEFAULT_CHUNK_SIZE,),
+            plain,
+        )
+
+        assert virtual_data.shape == (2 * DEFAULT_CHUNK_SIZE,)
+        assert_equal(virtual_data[:], 1.0)
+
+
+def test_create_virtual_dataset_plain_slices_edge_chunk(h5file):
+    """Plain-format slices for an edge chunk (trimmed extent along axis 0)."""
+    data = np.arange(30, dtype="i4")
+
+    with h5file as f:
+        f["_version_data/versions"].create_group("test_version")
+        create_base_dataset(
+            f, "test_data", data=np.empty((0,), dtype="i4"), chunks=(10,)
+        )
+        write_dataset(f, "test_data", data)
+
+        # All 3 chunks point at raw_data chunks 0:10, 10:20, 20:30
+        plain = {
+            (slice(0, 10, 1),): slice(0, 10, 1),
+            (slice(10, 20, 1),): slice(10, 20, 1),
+            (slice(20, 30, 1),): slice(20, 30, 1),
+        }
+        virtual_data = create_virtual_dataset(
+            f, "test_version", "test_data", (30,), plain
+        )
+        assert_equal(virtual_data[:], data)
+
+
+def test_create_virtual_dataset_plain_slices_inconsistent(h5file):
+    """Mismatched vds/raw extents raise, like in the legacy format."""
+    data = np.arange(30, dtype="i4")
+
+    with h5file as f:
+        f["_version_data/versions"].create_group("test_version")
+        create_base_dataset(
+            f, "test_data", data=np.empty((0,), dtype="i4"), chunks=(10,)
+        )
+        write_dataset(f, "test_data", data)
+
+        plain = {(slice(0, 10, 1),): slice(0, 5, 1)}
+        with pytest.raises(ValueError, match="Inconsistent slices dictionary"):
+            create_virtual_dataset(f, "test_version", "test_data", (30,), plain)

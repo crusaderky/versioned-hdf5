@@ -177,6 +177,9 @@ def commit_version(
                 chunk_size=chunk_size,
                 fill_value=data.fillvalue,
                 as_base_slabs=False,
+                # The array is consumed by commit_staged_changes() right away and
+                # never resized; edge chunks can be views instead of deep copies.
+                copy_edges=False,
             )
             slices = commit_staged_changes(f, name, staged_changes)
         else:

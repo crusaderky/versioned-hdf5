@@ -58,6 +58,12 @@ else:
 
 T = TypeVar("T", bound=np.generic)
 
+#: Cache of the SHA256 hashes of full slabs (a.k.a. the fill_value chunk).
+#: The full slab is immutable after construction and its hash depends only on
+#: (fill value, chunk size, dtype), so it is safe to share it across all instances.
+#: Key: (dtype.str, chunk_size, fill_value scalar)
+_full_slab_hash_cache: dict[tuple[Any, ...], NDArray[np.uint64]] = {}
+
 
 class StagedChangesArray(MutableMapping[Any, T]):
     """Writeable numpy array-like, a.k.a. virtual array, which wraps around a
@@ -755,7 +761,25 @@ class StagedChangesArray(MutableMapping[Any, T]):
         hplan = self._hash_plan()
         for slab_plan in hplan.slabs:
             slab = self._get_slab(slab_plan.slab_idx)
-            self.hash_tables[slab_plan.slab_idx] = slab_plan.hash_slab(slab)
+            if slab_plan.slab_idx == 0:
+                # The full slab never changes after construction and its hash depends
+                # only on the fill value, the chunk size, and the dtype. Reuse the
+                # hash across instances instead of rehashing it on every commit.
+                fv = self.fill_value
+                try:
+                    key: tuple[Any, ...] = (fv.dtype.str, self.chunk_size, fv[()])
+                    ht = _full_slab_hash_cache.get(key)
+                except TypeError:
+                    # Unhashable fill value (e.g. an ndarray or a writeable
+                    # void scalar): don't cache
+                    self.hash_tables[0] = slab_plan.hash_slab(slab)
+                    continue
+                if ht is None:
+                    ht = slab_plan.hash_slab(slab)
+                    _full_slab_hash_cache[key] = ht
+                self.hash_tables[0] = ht
+            else:
+                self.hash_tables[slab_plan.slab_idx] = slab_plan.hash_slab(slab)
 
     def commit(self, empty: Callable[..., MutableArrayProtocol] = np.empty) -> None:
         """Consolidate all staged chunks into a single, brand new base slab.
@@ -1011,6 +1035,7 @@ class StagedChangesArray(MutableMapping[Any, T]):
         chunk_size: tuple[int, ...],
         fill_value: Any | None = None,
         as_base_slabs: bool = True,
+        copy_edges: bool = True,
     ) -> StagedChangesArray:
         """Create a new StagedChangesArray from an array.
 
@@ -1024,11 +1049,20 @@ class StagedChangesArray(MutableMapping[Any, T]):
                 Do not create any base slabs.
                 Set the staged slabs as writeable views of ``arr`` if possible;
                 otherwise as read-only views; otherwise as deep copies.
+        copy_edges:
+            If False, the chunks at the edge of ``arr``, where its shape is not evenly
+            divisible by ``chunk_size``, are set as *views* of ``arr`` instead of
+            deep copies.
+
+            This is faster and uses less memory, but the returned StagedChangesArray
+            may only be consumed by :meth:`commit` - never resized or modified in a way
+            that would need to physically extend an edge chunk with fill_value.
+            ``arr`` must support views (e.g. numpy.ndarray).
         """
         # Don't deep-copy array-like objects, as long as they allow for views
         arr = cast(np.ndarray, asarray(arr))
 
-        if not as_base_slabs:
+        if not as_base_slabs and copy_edges:
             # If a staged slab is not exactly divisible by chunk_size, it is going to be
             # problematic down the line if we call resize() to enlarge the array.
             # Use views of the array for all complete chunks and deep-copy the partial
@@ -1042,6 +1076,7 @@ class StagedChangesArray(MutableMapping[Any, T]):
                     chunk_size=chunk_size,
                     fill_value=fill_value,
                     as_base_slabs=False,
+                    copy_edges=True,
                 )
                 out.resize(arr.shape)
                 _set_edges(out, arr, shape_round_down)
@@ -1077,11 +1112,21 @@ class StagedChangesArray(MutableMapping[Any, T]):
                 if isinstance(slab, np.ndarray):
                     slab.flags.writeable = False
             else:
-                assert slab.shape[0] % chunk_size[0] == 0
-                assert slab.shape[1:] == chunk_size[1:]
                 if not isinstance(slab, np.ndarray):
                     # Staged slabs must be numpy arrays.
                     slab = np.asarray(slab)
+                if copy_edges:
+                    assert slab.shape[0] % chunk_size[0] == 0
+                    assert slab.shape[1:] == chunk_size[1:]
+                else:
+                    # The last chunk along each axis may be smaller than chunk_size;
+                    # the slab is a view of it. It must be the last chunk along the
+                    # axis for this to be valid - see the copy_edges docstring.
+                    # Note: axis 0 needs no check: the slab spans the whole of arr
+                    # along it, and the hash/commit plans handle the edge chunk rows.
+                    for dim in range(1, len(chunk_size)):
+                        if chunk_idx[dim - 1] + 1 < n_chunks[dim]:
+                            assert slab.shape[dim] == chunk_size[dim]
 
             out.slabs.append(slab)
             out.hash_tables.append(None)
