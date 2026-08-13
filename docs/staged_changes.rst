@@ -24,6 +24,10 @@ The list of slabs is made of three parts:
 - The *staged slabs* are writeable numpy arrays that are created automatically by
   the ``StagedChangesArray`` whenever there is need to modify a chunk that lies on
   either the full slab or a base slab.
+  Their shape is ``(n*chunk_size[0], *chunk_size[1:])``, except for the slabs created
+  by ``from_array(as_base_slabs=False)``, which may be *trimmed*, i.e. smaller than a
+  whole number of chunks along one or more axes; see the
+  `resize() algorithm`_ section.
 
 Two numpy arrays of metadata are used to keep track of the chunks:
 
@@ -323,6 +327,25 @@ be physically filled with the fill_value:
    slab, which is created brand new for the occasion;
 2. then, there is a transfer from the full slab to the staged slab for the extra area
    that needs to be filled with the fill_value.
+
+Trimmed staged slabs
+^^^^^^^^^^^^^^^^^^^^
+When ``from_array(as_base_slabs=False)`` is handed an array whose shape is not exactly
+divisible by the ``chunk_size``, it creates staged slabs that are trimmed to the exact
+edge size, i.e. smaller than a whole number of chunks along one or more axes. This
+avoids deep-copying the partial edge chunks up front, in the hope that ``resize()`` is
+never called.
+
+Since ``resize()`` may need to write past the edge of a trimmed slab, the very first
+thing it does is to deep-copy any trimmed staged slab into a brand new slab padded to
+``(n*chunk_size[0], *chunk_size[1:])`` - with the cells beyond the edge left
+uninitialised, exactly like the padding of any other staged slab - and to clear the
+``_has_trimmed_staged_slabs`` flag. The chunks keep their offsets, so
+``slab_indices`` and ``slab_offsets`` are unaffected.
+
+All the other methods (``__getitem__``, ``__setitem__``, ``load()``, ``commit()``,
+etc.) transparently work on trimmed slabs without any special-casing, as they always
+clip their reads and writes to the edge of the virtual array.
 
 
 ``load()`` algorithm

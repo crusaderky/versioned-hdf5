@@ -27,7 +27,7 @@ from versioned_hdf5.subchunk_map import (
     read_many_slices_params_nd,
 )
 from versioned_hdf5.tools import asarray, format_ndindex, ix_with_slices
-from versioned_hdf5.typing_ import ArrayProtocol, MutableArrayProtocol
+from versioned_hdf5.typing_ import MutableArrayProtocol
 
 if cython.compiled:  # pragma: nocover
     from cython.cimports import numpy as np
@@ -144,6 +144,14 @@ class StagedChangesArray(MutableMapping[Any, T]):
     #: True if the user called resize() to alter the shape of the array; False otherwise
     _resized: bool
 
+    #: True if one or more staged slabs are trimmed, i.e. smaller than a whole
+    #: number of chunks along one or more axes; False otherwise.
+    #:
+    #: Only from_array(as_base_slabs=False) ever creates trimmed staged slabs.
+    #: resize() pads them with a deep copy if and when it is called,
+    #: and clears the flag.
+    _has_trimmed_staged_slabs: bool
+
     #: Map from each chunk to the index of the corresponding slab in the slabs list
     slab_indices: NDArray[np_hsize_t]
 
@@ -162,6 +170,12 @@ class StagedChangesArray(MutableMapping[Any, T]):
     #: Edge slabs that don't fully cover the chunk_size are padded with uninitialized
     #: cells; the shape of each staged slab is always
     #: (n*chunk_size[0], *chunk_size[1:]).
+    #:
+    #: The one exception is slabs created by from_array(as_base_slabs=False), which
+    #: are views of the input array and may be trimmed, i.e. smaller than a whole
+    #: number of chunks along one or more axes.
+    #: resize() deep-copies them into padded slabs if and when it is called.
+    #: See :attr:`_has_trimmed_staged_slabs`.
     #:
     #: When resize() shrinks the array, causing a *staged* slab to no longer hold
     #: any chunk, the slab is dereferenced and
@@ -220,6 +234,7 @@ class StagedChangesArray(MutableMapping[Any, T]):
 
         self.shape = shape
         self._resized = False
+        self._has_trimmed_staged_slabs = False
         self.writeable = True
 
         dtype = base_slabs[0].dtype if base_slabs else None
@@ -721,12 +736,19 @@ class StagedChangesArray(MutableMapping[Any, T]):
         Staged slabs that are no longer needed are dereferenced; their location in the
         slabs list is replaced with None.
         This never causes base slabs or the full slab to be dereferenced.
+
+        Trimmed staged slabs created by from_array(as_base_slabs=False) are deep-copied
+        into slabs padded to a whole number of chunks, as enlarging the array may
+        otherwise need to write beyond the edge of a trimmed slab.
         """
         if not self.writeable:
             raise ValueError("assignment destination is read-only")
 
         # Sanitize input (e.g. convert np.int64 to int)
         shape = tuple(int(s) for s in shape)
+
+        if self._has_trimmed_staged_slabs:
+            self._untrim_staged_slabs()
 
         plan = self._resize_plan(shape, copy=False)
 
@@ -737,6 +759,39 @@ class StagedChangesArray(MutableMapping[Any, T]):
         if shape != self.shape:
             self.shape = shape
             self._resized = True
+
+    def _untrim_staged_slabs(self) -> None:
+        """Deep-copy trimmed staged slabs into new slabs padded to full chunk_size.
+
+        Trimmed staged slabs are only ever created by
+        from_array(as_base_slabs=False); see _has_trimmed_staged_slabs.
+
+        The valid surface of each trimmed slab is copied into a brand new
+        ``np.empty`` slab of shape ``(n*chunk_size[0], *chunk_size[1:])``;
+        the cells beyond the edge are left uninitialised, exactly like the padding
+        of any other staged slab.
+        The chunks keep their offsets, so slab_indices and slab_offsets don't change.
+        """
+        chunk_size = self.chunk_size
+        for idx in range(self.staged_slabs_start, self.n_slabs):
+            slab = self.slabs[idx]
+            if slab is None:
+                continue
+            padded_shape = (
+                int(ceil_a_over_b(slab.shape[0], chunk_size[0])) * chunk_size[0],
+                *chunk_size[1:],
+            )
+            if slab.shape == padded_shape:
+                continue
+
+            new_slab = np.empty(padded_shape, dtype=slab.dtype)
+            new_slab[
+                (slice(0, slab.shape[0]),) + tuple(slice(0, s) for s in slab.shape[1:])
+            ] = slab
+            self.slabs[idx] = new_slab
+            self.hash_tables[idx] = None
+
+        self._has_trimmed_staged_slabs = False
 
     def load(self) -> None:
         """Load all chunks that are not yet in memory from the base array."""
@@ -1024,28 +1079,12 @@ class StagedChangesArray(MutableMapping[Any, T]):
                 Do not create any base slabs.
                 Set the staged slabs as writeable views of ``arr`` if possible;
                 otherwise as read-only views; otherwise as deep copies.
+                Edge chunks that are not exactly divisible by chunk_size are stored
+                in trimmed slabs; resize() will deep-copy them into slabs padded
+                to a whole number of chunks if and when it is called.
         """
         # Don't deep-copy array-like objects, as long as they allow for views
         arr = cast(np.ndarray, asarray(arr))
-
-        if not as_base_slabs:
-            # If a staged slab is not exactly divisible by chunk_size, it is going to be
-            # problematic down the line if we call resize() to enlarge the array.
-            # Use views of the array for all complete chunks and deep-copy the partial
-            # edge chunks.
-            shape_round_down = tuple(
-                s // c * c for s, c in zip(arr.shape, chunk_size, strict=True)
-            )
-            if shape_round_down != arr.shape:
-                out = StagedChangesArray.from_array(
-                    arr[tuple(slice(s) for s in shape_round_down)],
-                    chunk_size=chunk_size,
-                    fill_value=fill_value,
-                    as_base_slabs=False,
-                )
-                out.resize(arr.shape)
-                _set_edges(out, arr, shape_round_down)
-                return out
 
         out = StagedChangesArray.full(
             arr.shape, chunk_size=chunk_size, fill_value=fill_value, dtype=arr.dtype
@@ -1077,11 +1116,17 @@ class StagedChangesArray(MutableMapping[Any, T]):
                 if isinstance(slab, np.ndarray):
                     slab.flags.writeable = False
             else:
-                assert slab.shape[0] % chunk_size[0] == 0
-                assert slab.shape[1:] == chunk_size[1:]
                 if not isinstance(slab, np.ndarray):
                     # Staged slabs must be numpy arrays.
                     slab = np.asarray(slab)
+                # The last chunk along one or more axes is trimmed, i.e. smaller than
+                # chunk_size. Keep the slab as a view of arr rather than deep-copying
+                # the edge chunks; resize() will pad it if and when it is called.
+                if (
+                    slab.shape[0] % chunk_size[0] != 0
+                    or slab.shape[1:] != chunk_size[1:]
+                ):
+                    out._has_trimmed_staged_slabs = True
 
             out.slabs.append(slab)
             out.hash_tables.append(None)
@@ -2564,25 +2609,3 @@ def _make_transfer_plans(
             slab_indices=slab_indices,
             slab_offsets=slab_offsets,
         )
-
-
-def _set_edges(
-    dst: MutableArrayProtocol, src: ArrayProtocol, shape: tuple[int, ...]
-) -> None:
-    """Copy src into dst, but only for the edge area outside the given shape
-    (aligned to the top left corner).
-
-    This is equivalent to::
-
-        mask = np.ones(dst.shape, dtype=bool)
-        mask[*(slice(s) for s in shape)] = False
-        dst[mask] = src[mask]
-
-    except that the above would be ~O(dst.size) whereas this function is ~O(edge size).
-    """
-    assert src.shape == dst.shape
-    assert len(shape) == dst.ndim
-    for i, (start, stop) in enumerate(zip(shape, dst.shape, strict=True)):
-        if stop > start:
-            idx = tuple(slice(s) for s in shape[:i]) + (slice(start, stop),)
-            dst[idx] = src[idx]
