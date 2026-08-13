@@ -300,6 +300,14 @@ def write_dataset(
         raise ValueError(f"fillvalues do not match ({fillvalue} != {ds.fillvalue})")
 
     check_compatible_dtypes(data.dtype, ds.dtype)
+    if data.ndim == 0 or data.size == 0:
+        # Nothing to write; don't open the Hashtable (loading the hash table
+        # from disk is the dominant cost of this function for empty writes).
+        # Do make sure it exists, though: the legacy Hashtable used to create
+        # it as a side effect of being opened.
+        if "hash_table" not in f["_version_data"][name]:
+            Hashtable(f, name)
+        return {}
     # TODO: Handle more than one dimension
     old_shape = ds.shape
     slices: dict[Slice, Tuple] = {}
@@ -309,9 +317,6 @@ def write_dataset(
     with Hashtable(f, name) as hashtable:
         old_chunks = hashtable.largest_index
         chunks_reused = 0
-
-        if data.ndim == 0 or data.size == 0:
-            return {}
 
         for data_slice in ChunkSize(chunks).indices(data.shape):
             data_s = data[data_slice.raw]
@@ -418,7 +423,7 @@ def _raw_data_as_base_slab(raw_data: Dataset, dtype: np.dtype):
 
 def commit_staged_changes(
     f, name: str, staged_changes: StagedChangesArray
-) -> dict[Tuple, Slice]:
+) -> dict[tuple[slice, ...], slice]:
     """Commit a StagedChangesArray into `raw_data` and its on-disk hash table.
 
     1. Load the on-disk hash table dataset that hashes all chunks of `raw_data`
@@ -436,6 +441,8 @@ def commit_staged_changes(
        offsets are correct for raw_data.
     7. Tail-call `staged_changes.changes`, which returns the
        `{chunk_index: raw_data slice}` dict to be passed to `create_virtual_dataset`.
+       The format is `{tuple[slice, ...]: slice}`, with plain builtin slices - see
+       `create_virtual_dataset`.
 
     **TRANSITION NOTES**
 
@@ -557,8 +564,7 @@ def commit_staged_changes(
     # Build the {virtual dataset index: raw_data slice} mapping
     # TODO Migrated to a Cythonized loop that reads sc.slab_offsets directly
     return {
-        Tuple(*vds_slice): Slice(raw_data_slice[0])
-        for vds_slice, _, raw_data_slice in sc.changes()
+        vds_slice: raw_data_slice[0] for vds_slice, _, raw_data_slice in sc.changes()
     }
 
 
@@ -567,6 +573,15 @@ def create_virtual_dataset(
 ):
     """Create a new virtual dataset by stitching the chunks of the
     raw dataset together, as indicated by the slices dict.
+
+    Each dict entry maps the slice of the virtual dataset covering a chunk to the
+    corresponding slice on axis 0 of raw_data. Two formats are supported:
+
+    - ``{ndindex.Tuple: ndindex.Slice}`` - the legacy format, e.g. produced by
+      :func:`_recreate_virtual_dataset` and :func:`delete_versions`
+    - ``{tuple[slice, ...]: slice}`` - plain slices, e.g. produced by
+      :func:`commit_staged_changes`; the value is the (start, stop) slice of
+      raw_data along axis 0
 
     See Also
     --------
@@ -578,7 +593,12 @@ def create_virtual_dataset(
 
     layout = VirtualLayout(shape=shape, dtype=raw_data.dtype)
     if len(raw_data) == 0:
-        assert all(c.isempty() for c in slices)
+        assert all(
+            c.isempty()
+            if isinstance(c, Tuple)
+            else all(ci.start >= ci.stop for ci in c)
+            for c in slices
+        )
     else:
         layout._src_filenames.add(b".")
         space = h5s.create_simple(shape)
@@ -589,17 +609,31 @@ def create_virtual_dataset(
         # sense to expand the chunks in the raw dataset along multiple dimensions
         # (the true layout of the chunks in the raw dataset is irrelevant).
         for c, s0 in slices.items():
-            if len(c.args[0]) != len(s0):
-                raise ValueError(f"Inconsistent slices dictionary ({c.args[0]}, {s0})")
-            if c.isempty():
-                continue
+            if isinstance(c, Tuple):
+                # Legacy format: ndindex objects
+                if len(c.args[0]) != len(s0):
+                    raise ValueError(
+                        f"Inconsistent slices dictionary ({c.args[0]}, {s0})"
+                    )
+                if c.isempty():
+                    continue
 
-            s = (s0.reduce().raw, *(slice(0, len(ci), 1) for ci in c.args[1:]))
+                s = (s0.reduce().raw, *(slice(0, len(ci), 1) for ci in c.args[1:]))
+                vds_sel = c.raw
+            else:
+                # Plain format: tuple of slices -> raw_data axis-0 slice
+                if c[0].stop - c[0].start != s0.stop - s0.start:
+                    raise ValueError(f"Inconsistent slices dictionary ({c[0]}, {s0})")
+                if any(ci.start >= ci.stop for ci in c):
+                    continue
+
+                s = (s0, *(slice(0, ci.stop - ci.start, 1) for ci in c[1:]))
+                vds_sel = c
 
             # This is equivalent to `layout[c] = vs[s]`,
             # but faster because vs[s] deep-copies vs, which is slow.
             vs_sel = select(raw_data_shape, s, dataset=None)
-            sel = selector.make_selection(c.raw)
+            sel = selector.make_selection(vds_sel)
             layout.dcpl.set_virtual(sel.id, b".", raw_data_name, vs_sel.id)
 
     dtype_meta = raw_data.dtype.metadata

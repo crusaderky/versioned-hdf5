@@ -119,6 +119,9 @@ def recreate_dataset(f, name, newf, callback=None):
                     chunk_size=chunks,
                     fill_value=fillvalue,
                     as_base_slabs=False,
+                    # The array is consumed by commit_staged_changes() right away and
+                    # never resized; edge chunks can be views instead of deep copies.
+                    copy_edges=False,
                 )
                 slices = commit_staged_changes(newf, name, staged_changes)
             else:

@@ -1792,3 +1792,86 @@ slab_offsets:
 [[0 0 2 4 0]]
     """
     assert r == textwrap.dedent(expect).strip()
+
+
+def test_from_array_copy_edges_False():
+    """from_array(..., as_base_slabs=False, copy_edges=False) keeps edge chunks as
+    views of arr instead of deep-copying them; the result must only be consumed by
+    commit()."""
+    arr = np.arange(30, dtype="i4").reshape(2, 15)
+    chunk_size = (3, 4)  # Not divisible along either axis
+
+    sc = StagedChangesArray.from_array(
+        arr, chunk_size=chunk_size, as_base_slabs=False, copy_edges=False
+    )
+    assert sc.n_base_slabs == 0
+    # Every staged slab is a view of arr - no deep copies
+    for slab in sc.staged_slabs:
+        assert slab is not None
+        assert np.shares_memory(slab, arr)
+
+    # Default: the edge chunks are deep copies
+    sc_copy = StagedChangesArray.from_array(
+        arr, chunk_size=chunk_size, as_base_slabs=False, copy_edges=True
+    )
+    for slab in sc_copy.staged_slabs:
+        assert slab is not None
+        assert not np.shares_memory(slab, arr)
+
+    # Both variants commit to the same contents
+    sc.commit()
+    sc_copy.commit()
+    assert_array_equal(sc[()], arr)
+    assert_array_equal(sc_copy[()], arr)
+
+
+def test_from_array_copy_edges_False_divisible():
+    """copy_edges makes no difference when the shape is divisible by chunk_size"""
+    arr = np.arange(24, dtype="i4").reshape(2, 12)
+    chunk_size = (2, 4)
+
+    sc = StagedChangesArray.from_array(
+        arr, chunk_size=chunk_size, as_base_slabs=False, copy_edges=False
+    )
+    for slab in sc.staged_slabs:
+        assert slab is not None
+        assert np.shares_memory(slab, arr)
+    sc.commit()
+    assert_array_equal(sc[()], arr)
+
+
+def test_full_slab_hash_cache():
+    """The hash of the full slab (the fill_value chunk) is shared across all instances
+    with the same fill value, chunk size, and dtype."""
+    a = StagedChangesArray.full((20, 20), chunk_size=(10, 10), fill_value=7, dtype="i4")
+    a._calc_hashes()
+    b = StagedChangesArray.full((20, 20), chunk_size=(10, 10), fill_value=7, dtype="i4")
+    b._calc_hashes()
+    assert a.hash_tables[0] is b.hash_tables[0]
+
+    # Different fill value, dtype, or chunk size -> different cache entry
+    c = StagedChangesArray.full((20, 20), chunk_size=(10, 10), fill_value=8, dtype="i4")
+    c._calc_hashes()
+    assert c.hash_tables[0] is not b.hash_tables[0]
+
+    d = StagedChangesArray.full((20, 20), chunk_size=(10, 10), fill_value=7, dtype="i8")
+    d._calc_hashes()
+    assert d.hash_tables[0] is not b.hash_tables[0]
+
+    e = StagedChangesArray.full((20, 20), chunk_size=(5, 5), fill_value=7, dtype="i4")
+    e._calc_hashes()
+    assert e.hash_tables[0] is not b.hash_tables[0]
+
+
+def test_full_slab_hash_cache_commit():
+    """Committing two identical arrays deduplicates against the cached full-slab hash
+    the same way as against a freshly computed one."""
+    fill_value = 7
+    a = StagedChangesArray.full(
+        (20, 20), chunk_size=(10, 10), fill_value=fill_value, dtype="i4"
+    )
+    # Everything is full of fill_value; nothing may be written
+    a.commit()
+    assert a.n_base_slabs == 0  # Nothing survived deduplication
+    assert a.n_staged_slabs == 0
+    assert_array_equal(a[()], np.full((20, 20), fill_value, dtype="i4"))
