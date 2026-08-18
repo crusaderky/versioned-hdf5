@@ -8,6 +8,27 @@ CHUNK_SIZES = [1024 // 8, 64 * 1024 // 8, 1024 * 1024 // 8]
 # Total bytes transferred per benchmark call ~16 MiB
 TOTAL_ELEMENTS = 16 * 1024 * 1024 // 8
 
+#: Memory layouts of the numpy side of the transfer. read_many_slices uses the hdf5 C
+#: API for "contiguous" and "sliced"; "strided" and "transposed" fall back to the
+#: pure-python transfer. See slicetools.pyx::_np_hyperslab_dims.
+LAYOUTS = ["contiguous", "sliced", "strided", "transposed"]
+#: Number of columns of the 2D arrays of the memory layout benchmarks
+NCOLS = 128
+
+
+def make_view(shape: tuple[int, int], layout: str) -> np.ndarray:
+    """Return a writeable float64 array of exactly `shape` with the given layout"""
+    if layout == "contiguous":
+        return np.zeros(shape, dtype=np.float64)
+    if layout == "sliced":
+        # Innermost axis still contiguous
+        return np.zeros((shape[0], shape[1] + 8), dtype=np.float64)[:, 4:-4]
+    if layout == "strided":
+        return np.zeros((shape[0], shape[1] * 2), dtype=np.float64)[:, ::2]
+    if layout == "transposed":
+        return np.zeros(shape[::-1], dtype=np.float64).T
+    raise AssertionError(f"unknown layout: {layout}")
+
 
 class TimeReadManySlicesNumPy:
     """Benchmark read_many_slices with NumPy src and NumPy dst."""
@@ -77,6 +98,65 @@ class TimeReadManySlicesNpToH5(_TimeReadManySlicesH5Base):
     """Benchmark read_many_slices with numpy src and h5py dst."""
 
     def time_read_many_slices(self, chunk_size, fast):
+        read_many_slices(
+            self.np_arr,
+            self.h5_dset,
+            self.src_start,
+            self.dst_start,
+            self.count,
+            fast=fast,
+        )
+
+
+class _TimeReadManySlicesLayoutBase(Benchmark):
+    """Common setup for transfers between a h5py dataset and a non-contiguous numpy
+    array.
+    """
+
+    params = [CHUNK_SIZES, LAYOUTS, [None, False]]
+    param_names = ["chunk_size", "layout", "fast"]
+
+    def setup(self, chunk_size, layout, fast):
+        super().setup(chunk_size, layout, fast)
+        rows_per_slice = max(1, chunk_size // NCOLS)
+        nrows = TOTAL_ELEMENTS // NCOLS
+        n_slices = nrows // rows_per_slice
+
+        self.np_arr = make_view((nrows, NCOLS), layout)
+        self.np_arr[:] = self.rng.random((nrows, NCOLS))
+        self.h5_dset = self.file.create_dataset(
+            "data",
+            # Initialize with data so reads return something realistic
+            data=self.rng.random((nrows, NCOLS)),
+            chunks=(rows_per_slice, NCOLS),
+        )
+
+        # Contiguous, chunk-aligned offsets in both src and dst
+        starts = np.zeros((n_slices, 2), dtype=np.uint64)
+        starts[:, 0] = np.arange(n_slices) * rows_per_slice
+        self.src_start = starts
+        self.dst_start = starts
+        self.count = np.array([rows_per_slice, NCOLS], dtype=np.uint64)
+
+
+class TimeReadManySlicesLayoutH5ToNp(_TimeReadManySlicesLayoutBase):
+    """Benchmark read_many_slices with h5py src and non-contiguous NumPy dst."""
+
+    def time_read_many_slices(self, chunk_size, layout, fast):
+        read_many_slices(
+            self.h5_dset,
+            self.np_arr,
+            self.src_start,
+            self.dst_start,
+            self.count,
+            fast=fast,
+        )
+
+
+class TimeReadManySlicesLayoutNpToH5(_TimeReadManySlicesLayoutBase):
+    """Benchmark read_many_slices with non-contiguous NumPy src and h5py dst."""
+
+    def time_read_many_slices(self, chunk_size, layout, fast):
         read_many_slices(
             self.np_arr,
             self.h5_dset,

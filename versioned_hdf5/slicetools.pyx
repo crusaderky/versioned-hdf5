@@ -99,6 +99,8 @@ cdef extern from "hdf5.h":
     ) except H5S_sel_type.H5S_SEL_ERROR nogil
     cdef herr_t H5Sclose(hid_t space_id) nogil
     cdef int H5Sget_simple_extent_ndims(hid_t space_id) nogil
+    cdef enum:
+        H5S_MAX_RANK
     cdef hid_t H5Screate_simple	(
         int rank,
         const hsize_t* dims,
@@ -359,11 +361,16 @@ cpdef void read_many_slices(
 
         The following combinations of src and dst are optimized:
 
-        - src is a h5py.Dataset with simple extents; dst is a C-contiguous numpy array
-        - dst is a h5py.Dataset with simple extents; src is a C-contiguous numpy array
+        - src is a h5py.Dataset with simple extents; dst is a numpy array whose
+          strides suit H5Sselect_hyperslab
+        - dst is a h5py.Dataset with simple extents; src is a numpy array whose strides
+          suit H5Sselect_hyperslab
 
         All other combinations are supported but fall back to a generic, pure-python
-        transfer.
+        transfer. C-contiguous arrays qualify, as does any view of one that slices any
+        axis and steps all but the innermost: ``a[1:4]``, ``a[:, 2:5]``, ``a[::2]``,
+        ``a[:, None]``. ``a[:, ::2]``, ``a.T``, Fortran order and ``a[::-1]`` don't.
+        See _np_hyperslab_dims.
 
     src_start: array-like
         The starting coordinates, a.k.a. offsets, of the slices in src.
@@ -385,8 +392,8 @@ cpdef void read_many_slices(
     fast: bool, optional
         If True, use the hdf5 C API directly to transfer the data. This is possible when
         src is a h5py dataset with a simple data type (see h5py.Dataset._fast_read_ok)
-        and dst is a C-contiguous numpy array, or the other way around.
-        Raise if fast transfer is not possible.
+        and dst is a numpy array whose strides suit H5Sselect_hyperslab, or the other
+        way around. Raise if fast transfer is not possible.
 
         If False, always use pure Python numpy syntax to slice src and dst.
 
@@ -438,7 +445,7 @@ cpdef void read_many_slices(
 
     Performance notes
     -----------------
-    When reading/writing between h5py and a C-contiguous numpy array, this function
+    When reading/writing between h5py and a suitable numpy array, this function
     calls::
 
         H5Sselect_hyperslab(file_id, H5S_SELECT_SET, ...)
@@ -476,12 +483,17 @@ cpdef void read_many_slices(
         dst_axis0_offset = dst.offset
         dst = dst.raw_data
 
+    cdef hsize_t[NPY_MAXDIMS] mem_dims  # See _np_hyperslab_dims
+
     cdef bint fast_h5_to_np = False
     cdef bint fast_np_to_h5 = False
     if fast is not False:
         with phil:
-            fast_h5_to_np = _supports_fast_h5_np(src, dst)
-            fast_np_to_h5 = _supports_fast_h5_np(dst, src)
+            # Only one of the two directions can ever be viable
+            if _supports_fast_h5_np(src, dst):
+                fast_h5_to_np = _np_hyperslab_dims(dst, mem_dims)
+            elif _supports_fast_h5_np(dst, src):
+                fast_np_to_h5 = _np_hyperslab_dims(src, mem_dims)
         if fast is True and not fast_h5_to_np and not fast_np_to_h5:
             raise ValueError("fast transfer is not possible with given src/dst arrays")
     cdef bint bfast = fast_h5_to_np or fast_np_to_h5
@@ -521,9 +533,6 @@ cpdef void read_many_slices(
 
     cdef np.ndarray src_shape = np.array(src.shape, dtype=np_hsize_t)
     cdef np.ndarray dst_shape = np.array(dst.shape, dtype=np_hsize_t)
-    # On 32-bit platforms, sizeof(hsize_t) == 8; sizeof(npy_intp) == 4
-    # On 64-bit platforms, don't copy unnecessarily
-    dst_shape = asarray(dst_shape, dtype=np_hsize_t)
 
     clipped_count = _clip_count(
         src_shape,
@@ -542,7 +551,7 @@ cpdef void read_many_slices(
             src,
             dst,
             False,
-            <hsize_t*>dst_shape.data,
+            mem_dims,
             src_start,
             dst_start,
             clipped_count,
@@ -554,7 +563,7 @@ cpdef void read_many_slices(
             dst,
             src,
             True,
-            <hsize_t*>src_shape.data,
+            mem_dims,
             src_start,
             dst_start,
             clipped_count,
@@ -640,13 +649,94 @@ cdef hsize_t[:, :] _clip_count(
 
 
 cdef bint _supports_fast_h5_np(maybe_h5_dset, maybe_np_arr):
-    """Return True if we can use _read_many_slices_h5_np; False otherwise."""
+    """Return True if the types of the two arrays allow _read_many_slices_h5_np.
+    The numpy strides must also pass _np_hyperslab_dims.
+    """
     return (
         isinstance(maybe_h5_dset, h5py.Dataset)
         and isinstance(maybe_np_arr, np.ndarray)
         and maybe_h5_dset._fast_read_ok
-        and maybe_np_arr.flags.c_contiguous
     )
+
+
+cdef bint _np_hyperslab_dims(np.ndarray arr, hsize_t* dims):
+    """Populate dims with the extents of a simple hdf5 dataspace that describes the
+    memory of a numpy array, for use as the mem_space of H5Dread/H5Dwrite.
+    Return False if arr's strides can't be expressed that way.
+
+    A dataspace of extents dims is addressed by the strides C[j] = prod(dims[j+1:]) and
+    a hyperslab visits its points in row-major order, exactly like a C-contiguous numpy
+    array. So arr can be selected with H5Sselect_hyperslab(start=index, stride=step) as
+    long as some dims has C[j] equal to arr's j-th element stride. dims[0] is free; the
+    others follow from dims[j+1] = C[j] // C[j+1].
+
+    Every axis longer than one point needs a stride that is
+
+    - positive and a whole multiple of the itemsize;
+    - a whole multiple of the next stride inwards, as C[j] always divides C[j-1];
+    - at least the memory footprint of the axes inside it, or dims won't fit the
+      selection;
+    - exactly the itemsize, if innermost, as C[ndim-1] is always 1. Folding it into the
+      hyperslab start and step would work, but then hdf5 copies one point at a time
+      instead of whole contiguous runs: 15x to 40x slower than letting numpy do the
+      strided copy. Same goes for a caller-provided innermost src_stride or dst_stride,
+      which we have no say over.
+
+    So this accepts C-contiguous arrays plus any view of one that slices any axis and
+    steps all but the innermost: a[1:4], a[:, 2:5], a[::2], a[:, None]. It rejects
+    a[:, ::2] (see above), a.T and Fortran order (a hyperslab can't walk memory
+    backwards), a[::-1] (negative strides), and np.broadcast_to or sliding_window_view
+    (overlapping axes).
+    """
+    cdef int ndim = np.PyArray_NDIM(arr)
+    cdef np.npy_intp* shape = np.PyArray_DIMS(arr)
+    cdef np.npy_intp* strides = np.PyArray_STRIDES(arr)
+    cdef np.npy_intp itemsize = np.PyArray_ITEMSIZE(arr)
+    cdef hsize_t[NPY_MAXDIMS] np_strides  # arr's element strides; 0 = don't care
+    cdef hsize_t[NPY_MAXDIMS] c_strides  # dataspace strides, in points
+    cdef hsize_t reach  # points to fit along the next dataspace axis outwards
+    cdef hsize_t min_stride, stride_j
+    cdef int j
+
+    # Unreachable, as the other side of the transfer is a hdf5 dataset with the same
+    # ndim and dtype; guards the divisions below.
+    if ndim > H5S_MAX_RANK or itemsize < 1:
+        return False
+
+    # numpy sets the stride of a length-1 axis arbitrarily and never applies it. Copy
+    # the stride of the axis outside it: that imposes the same constraints as if the
+    # axis weren't there, which is always the least restrictive choice.
+    # 0 = nothing outside it; pick the tightest stride below instead.
+    for j in range(ndim):
+        if shape[j] > 1:
+            if strides[j] <= 0 or strides[j] % itemsize != 0:
+                return False
+            np_strides[j] = <hsize_t>strides[j] // <hsize_t>itemsize
+        elif j > 0:
+            np_strides[j] = np_strides[j - 1]
+        else:
+            np_strides[j] = 0
+
+    if shape[ndim - 1] > 1 and np_strides[ndim - 1] != 1:
+        return False
+    c_strides[ndim - 1] = 1
+    reach = <hsize_t>shape[ndim - 1]
+
+    for j in range(ndim - 2, -1, -1):
+        # Tightest stride that doesn't overlap the axes inside this one. Can't overflow:
+        # it's bounded by arr's buffer size unless we already returned False.
+        min_stride = c_strides[j + 1] * reach
+        stride_j = np_strides[j]
+        if stride_j == 0:
+            stride_j = min_stride
+        elif stride_j < min_stride or stride_j % c_strides[j + 1] != 0:
+            return False
+        c_strides[j] = stride_j
+        dims[j + 1] = stride_j // c_strides[j + 1]
+        reach = <hsize_t>shape[j]
+
+    dims[0] = reach
+    return True
 
 
 @cython.wraparound(False)
@@ -656,7 +746,7 @@ cdef void _read_many_slices_h5_np (
     h5_dset: h5py.Dataset,
     np.ndarray np_arr,
     bint write,
-    const hsize_t* np_arr_shape,
+    const hsize_t* mem_dims,
     const hsize_t[:, :] src_start,
     const hsize_t[:, :] dst_start,
     const hsize_t[:, :] count,
@@ -664,7 +754,8 @@ cdef void _read_many_slices_h5_np (
     const hsize_t[:, :] dst_stride,
 ):
     """Implements read_many_slices data transfer between an h5py.Dataset with simple
-    extents (h5py.Dataset._fast_read_ok) and a C-contiguous numpy array.
+    extents (h5py.Dataset._fast_read_ok) and a numpy array, with ``mem_dims`` from
+    _np_hyperslab_dims.
 
     Performance notes
     -----------------
@@ -686,7 +777,7 @@ cdef void _read_many_slices_h5_np (
         with nogil:
             nslices, ndim = src_start.shape[:2]
 
-            mem_space_id = H5Screate_simple(ndim, np_arr_shape, NULL)
+            mem_space_id = H5Screate_simple(ndim, mem_dims, NULL)
             if mem_space_id == H5I_INVALID_HID:
                 raise HDF5Error()
 
@@ -764,7 +855,8 @@ cdef void _read_many_slices_slow (
     - src or dst is a h5py.Dataset but h5py.Dataset._fast_read_ok returns False.
       This is to avoid replicating the complex machinery found in
       h5py.Dataset.__getitem__/__setitem__;
-    - src or dst are non-contiguous NumPy arrays;
+    - src or dst is a NumPy array whose strides don't suit H5Sselect_hyperslab, e.g. a
+      transposed one (see _np_hyperslab_dims);
     - both src and dst are NumPy arrays;
     - either src and dst are arbitrary NumPy-like objects (neither NumPy nor h5py).
 
