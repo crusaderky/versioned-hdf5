@@ -130,39 +130,54 @@ cpdef void hash_slab(
         return
 
     # Case 2: the innermost axis is strided (e.g. broadcasted or transposed slabs,
-    # or a step along the innermost axis). Deep-copy each chunk into a
-    # chunk-sized scratch buffer and hash it as a contiguous blob, so that the
-    # extra memory is bounded by the chunk size instead of the whole slab.
-    # The copy is done in C, holding no GIL and making no Python calls per chunk.
+    # or a step along the innermost axis).
     if src.strides[ndim - 1] != itemsize:
-        if nchunks:
-            scratch = np.empty(tuple(chunk_size), dtype=src.dtype)
-            with nogil:
-                for i in range(nchunks):
-                    total_bytes = itemsize
-                    for j in range(ndim):
-                        total_bytes *= count[i, j]
+        # The broadcasted full slab (a fill_value broadcast from 0-d) has all-zero
+        # strides and is a single chunk, so a C-contiguous copy is a fast SIMD
+        # fill bounded by the chunk size. This is the common case (every commit
+        # hashes the full slab), so it's worth the shortcut over the gather below.
+        is_broadcast = True
+        for j in range(ndim):
+            if src.strides[j] != 0:
+                is_broadcast = False
+                break
 
-                    _copy_chunk(
-                        <const unsigned char*>src.data
-                        + src.strides[0] * src_start[i],
-                        <unsigned char*>scratch.data,
-                        count[i],
-                        ndim,
-                        itemsize,
-                        src.strides,
-                    )
-                    _hash_chunk_from_ptr(
-                        <const unsigned char*>scratch.data,
-                        &hash_table[hash_rows[i], 0],
-                        count[i],
-                        ndim,
-                        itemsize,
-                        scratch.strides,
-                        ndim,
-                        total_bytes,
-                    )
-        return
+        if is_broadcast:
+            src = np.ascontiguousarray(src)
+        else:
+            # Deep-copy each chunk into a chunk-sized scratch buffer and hash it as
+            # a contiguous blob, so that the extra memory is bounded by the chunk
+            # size instead of the whole slab.
+            # The copy is done in C, holding no GIL and making no Python calls
+            # per chunk.
+            if nchunks:
+                scratch = np.empty(tuple(chunk_size), dtype=src.dtype)
+                with nogil:
+                    for i in range(nchunks):
+                        total_bytes = itemsize
+                        for j in range(ndim):
+                            total_bytes *= count[i, j]
+
+                        _copy_chunk(
+                            <const unsigned char*>src.data
+                            + src.strides[0] * src_start[i],
+                            <unsigned char*>scratch.data,
+                            count[i],
+                            ndim,
+                            itemsize,
+                            src.strides,
+                        )
+                        _hash_chunk_from_ptr(
+                            <const unsigned char*>scratch.data,
+                            &hash_table[hash_rows[i], 0],
+                            count[i],
+                            ndim,
+                            itemsize,
+                            scratch.strides,
+                            ndim,
+                            total_bytes,
+                        )
+            return
 
     # Case 3: Non-object slab, C-contiguous along the innermost axis.
     # The other axes may be strided (e.g. stepped or transposed slabs):
