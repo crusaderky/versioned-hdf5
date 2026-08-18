@@ -76,8 +76,10 @@ cpdef void hash_slab(
     ----------
     src:
         The slab to read from; always a NumPy array (a staged slab, or the broadcasted
-        full slab). Note that non-NumPy base slabs (e.g. backed by h5py) are never
-        hashed here; their hashes are loaded from disk.
+        full slab). It must be C-contiguous along the innermost axis, or (as a
+        stopgap for e.g. the broadcasted full slab) it is copied to C-contiguity.
+        Other axes may be strided. Note that non-NumPy base slabs (e.g. backed by
+        h5py) are never hashed here; their hashes are loaded from disk.
     hash_table:
         2D C-contiguous array of uint64 and shape ``(n, 4)``, modified in place.
         ``n`` is the number of chunks in the slab.
@@ -118,23 +120,27 @@ cpdef void hash_slab(
             )
         return
 
-    # Case 2: full slab. This is a single chunk; it's ok to be suboptimal.
-    if not src.flags.c_contiguous:
+    # Case 2: The innermost axis must be contiguous, or each chunk couldn't be
+    # hashed as a sequence of contiguous rows. If it isn't (e.g. broadcasted or
+    # transposed slabs, or a step along the innermost axis), make a full copy;
+    # broadcasted full slabs end up here, and it's ok to be suboptimal for them.
+    if src.strides[ndim - 1] != itemsize:
         src = np.ascontiguousarray(src)
 
-    # Case 3: Non-object slab, at least C-contiguous along the innermost axis
-    # (edge chunks may not be C-contiguous on axes[:-1])
-    # release GIL for the loop.
+    # Case 3: Non-object slab, C-contiguous along the innermost axis.
+    # The other axes may be strided (e.g. stepped or transposed slabs):
+    # chunks are then hashed one row at a time.
+    # Release the GIL for the loop.
     # Each chunk is a slice along axis 0; byte offset = start * stride0.
     cdef bint is_contiguous
     with nogil:
-        stride0 = itemsize
-        for j in range(1, ndim):
-            stride0 *= src.shape[j]
+        stride0 = src.strides[0]
 
         for i in range(nchunks):
             offset = stride0 * src_start[i]
-            total_bytes = stride0 * count[i, 0]
+            total_bytes = itemsize
+            for j in range(ndim):
+                total_bytes *= count[i, j]
 
             # Test whether this chunk is one C-contiguous blob, i.e. whether
             # strides[j] == strides[j+1] * count[i, j+1] for all axes but the last
