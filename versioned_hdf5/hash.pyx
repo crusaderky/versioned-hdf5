@@ -126,6 +126,7 @@ cpdef void hash_slab(
     # (edge chunks may not be C-contiguous on axes[:-1])
     # release GIL for the loop.
     # Each chunk is a slice along axis 0; byte offset = start * stride0.
+    cdef bint is_contiguous
     with nogil:
         stride0 = itemsize
         for j in range(1, ndim):
@@ -134,6 +135,18 @@ cpdef void hash_slab(
         for i in range(nchunks):
             offset = stride0 * src_start[i]
             total_bytes = stride0 * count[i, 0]
+
+            # Test whether this chunk is one C-contiguous blob, i.e. whether
+            # strides[j] == strides[j+1] * count[i, j+1] for all axes but the last
+            # (the innermost axis is contiguous by the contract above).
+            # Edge chunks with trimmed counts may fail this even when the slab is
+            # C-contiguous, so the test must be per-chunk.
+            is_contiguous = True
+            for j in range(ndim - 1):
+                if src.strides[j] != src.strides[j + 1] * count[i, j + 1]:
+                    is_contiguous = False
+                    break
+
             _hash_chunk_from_ptr(
                 <const unsigned char*>src.data + offset,
                 &hash_table[hash_rows[i], 0],
@@ -141,6 +154,7 @@ cpdef void hash_slab(
                 ndim,
                 itemsize,
                 src.strides,
+                is_contiguous,
                 total_bytes,
             )
 
@@ -185,11 +199,16 @@ cdef int _hash_chunk_from_ptr(
     hsize_t ndim,
     hsize_t itemsize,
     npy_intp* strides,
+    bint is_contiguous,
     size_t total_bytes,
 ) except -1 nogil:
     """Hash a single chunk given a raw pointer and strides.
     The chunk must be not object dtype, not StringDType, not broadcasted, and
     C-contiguous at least along the innermost axis.
+
+    ``is_contiguous`` must state whether the chunk is one C-contiguous blob
+    (strides[j] == strides[j+1] * shape[j+1] for all axes but the last), as tested
+    by the caller; when True, ``total_bytes`` must be its size in bytes.
     """
     cdef EVP_MD_CTX* ctx
     cdef hsize_t[NPY_MAXDIMS] outer_idx
@@ -197,14 +216,6 @@ cdef int _hash_chunk_from_ptr(
     cdef hsize_t inner_size
     cdef hsize_t offset
     cdef hsize_t j
-    cdef bint is_contiguous
-
-    # Check C-contiguous: strides[j] == strides[j+1] * shape[j+1]
-    is_contiguous = True
-    for j in range(ndim - 1):
-        if strides[j] != strides[j + 1] * shape[j + 1]:
-            is_contiguous = False
-            break
 
     ctx = EVP_MD_CTX_new()
     if ctx == NULL:
