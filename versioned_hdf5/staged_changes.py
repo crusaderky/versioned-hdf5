@@ -1941,6 +1941,7 @@ class HashSlabPlan:
     src_start: hsize_t[::1]
     count: hsize_t[:, ::1]
     chunk_size_0: hsize_t
+    chunk_size: hsize_t[::1]
 
     def hash_slab(self, slab: np.ndarray):
         """Hash the slab and return a new hash table"""
@@ -1953,7 +1954,7 @@ class HashSlabPlan:
             hash_rows[i] = self.src_start[i] // cs0
 
         ht = np.zeros((nchunks, 4), dtype=np.uint64)
-        hash_slab(slab, ht, hash_rows, self.src_start, self.count)
+        hash_slab(slab, ht, hash_rows, self.src_start, self.count, self.chunk_size)
 
         # We'll never write to it again
         ht.flags.writeable = False
@@ -2008,6 +2009,7 @@ class HashPlan:
         self.slabs = []
         ndim = len(shape)
         chunk_size_0: hsize_t = chunk_size[0]
+        chunk_size_arr = np.asarray(chunk_size, dtype=np_hsize_t)
 
         _, mappers = index_chunk_mappers((), shape, chunk_size)
         if not mappers:  # size-0 array: no chunks at all
@@ -2024,6 +2026,7 @@ class HashPlan:
                     chunk_size_0=chunk_size_0,
                     src_start=np.zeros((1,), dtype=np_hsize_t),
                     count=np.asarray([chunk_size], dtype=np_hsize_t),
+                    chunk_size=chunk_size_arr,
                 )
             )
 
@@ -2064,6 +2067,7 @@ class HashPlan:
                         chunk_size_0=chunk_size_0,
                         src_start=slab_off_col[slab_start:slab_stop],
                         count=count[slab_start:slab_stop],
+                        chunk_size=chunk_size_arr,
                     )
                 )
                 slab_start = slab_stop

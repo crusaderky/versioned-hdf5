@@ -47,6 +47,7 @@ def test_single_chunk():
         np.array([0], dtype=np_hsize_t),
         np.array([0], dtype=np_hsize_t),
         np.array([[10]], dtype=np_hsize_t),
+        np.array([10], dtype=np_hsize_t),
     )
     assert rows_as_digests(ht)[0] == reference(slab)
 
@@ -65,6 +66,7 @@ def test_multiple_chunks_route_to_rows():
         np.array([0, 3, 2], dtype=np_hsize_t),
         np.array([0, 12, 8], dtype=np_hsize_t),
         np.array([[4], [4], [4]], dtype=np_hsize_t),
+        np.array([4], dtype=np_hsize_t),
     )
     digests = rows_as_digests(ht)
     assert digests[0] == reference(slab[0:4])
@@ -86,7 +88,7 @@ def test_edge_chunk_ignores_uninitialised_memory():
     rows = np.array([0, 1], dtype=np_hsize_t)
 
     ht = np.zeros((2, 4), dtype=np.uint64)
-    hash_slab(slab, ht, rows, src_start, count)
+    hash_slab(slab, ht, rows, src_start, count, np.array([3, 5], dtype=np_hsize_t))
     h0, h1 = rows_as_digests(ht)
     assert h0 == reference(slab[0:3, :])
     assert h1 == reference(slab[3:5, :])
@@ -94,7 +96,7 @@ def test_edge_chunk_ignores_uninitialised_memory():
     # Poison the uninitialised row and re-hash: the digests must be unchanged.
     slab[5] = 999
     ht2 = np.zeros((2, 4), dtype=np.uint64)
-    hash_slab(slab, ht2, rows, src_start, count)
+    hash_slab(slab, ht2, rows, src_start, count, np.array([3, 5], dtype=np_hsize_t))
     assert rows_as_digests(ht2) == [h0, h1]
 
 
@@ -111,6 +113,7 @@ def test_column_edge_is_made_contiguous():
         np.array([0], dtype=np_hsize_t),
         np.array([0], dtype=np_hsize_t),
         np.array([[4, 3]], dtype=np_hsize_t),
+        np.array([4, 5], dtype=np_hsize_t),
     )
     sub = slab[0:4, 0:3]
     assert not sub.flags.c_contiguous
@@ -130,6 +133,7 @@ def test_full_slab_broadcast():
         np.array([0], dtype=np_hsize_t),
         np.array([0], dtype=np_hsize_t),
         np.array([[3, 4]], dtype=np_hsize_t),
+        np.array([3, 4], dtype=np_hsize_t),
     )
     assert rows_as_digests(ht)[0] == reference(np.full((3, 4), 42, dtype="u2"))
 
@@ -144,6 +148,7 @@ def test_empty_chunk():
         np.array([0], dtype=np_hsize_t),
         np.array([0], dtype=np_hsize_t),
         np.array([[0, 3]], dtype=np_hsize_t),
+        np.array([1, 3], dtype=np_hsize_t),
     )
     (h,) = rows_as_digests(ht)
     assert h == hashlib.sha256(b"(0, 3)").digest()
@@ -159,6 +164,7 @@ def test_no_chunks_is_noop():
         np.zeros(0, dtype=np_hsize_t),
         np.zeros(0, dtype=np_hsize_t),
         np.zeros((0, 1), dtype=np_hsize_t),
+        np.array([1], dtype=np_hsize_t),
     )
     assert rows_as_digests(ht) == [b"\x00" * 32]  # Never written
 
@@ -178,6 +184,7 @@ def test_pod_dtypes_multichunk(dtype):
         np.array([0, 1, 2], dtype=np_hsize_t),
         np.array([0, 2, 4], dtype=np_hsize_t),
         np.array([[2], [2], [2]], dtype=np_hsize_t),
+        np.array([2], dtype=np_hsize_t),
     )
     digests = rows_as_digests(ht)
     for j, start in ((0, 0), (1, 2), (2, 4)):
@@ -193,6 +200,7 @@ def test_object_slab():
         np.array([0, 1, 2], dtype=np_hsize_t),
         np.array([0, 2, 4], dtype=np_hsize_t),
         np.array([[2], [2], [2]], dtype=np_hsize_t),
+        np.array([2], dtype=np_hsize_t),
     )
     digests = rows_as_digests(ht)
     for j, start in enumerate([0, 2, 4]):
@@ -205,7 +213,7 @@ def test_object_edge_chunk_ignores_uninitialised():
     count = np.array([[1]], dtype=np_hsize_t)  # only "ccc"
     rows = np.array([0], dtype=np_hsize_t)
     ht = np.zeros((1, 4), dtype=np.uint64)
-    hash_slab(slab, ht, rows, src_start, count)
+    hash_slab(slab, ht, rows, src_start, count, np.array([1], dtype=np_hsize_t))
     assert rows_as_digests(ht)[0] == reference(slab[2:3])
 
 
@@ -219,6 +227,7 @@ def test_npystrings_slab():
         np.array([0, 1], dtype=np_hsize_t),
         np.array([0, 2], dtype=np_hsize_t),
         np.array([[2], [2]], dtype=np_hsize_t),
+        np.array([2], dtype=np_hsize_t),
     )
     digests = rows_as_digests(ht)
     assert digests[0] == reference(slab[0:2])
@@ -234,6 +243,7 @@ def test_identical_chunks_same_hash():
         np.array([0, 1], dtype=np_hsize_t),
         np.array([0, 2], dtype=np_hsize_t),
         np.array([[2], [2]], dtype=np_hsize_t),
+        np.array([2], dtype=np_hsize_t),
     )
     assert rows_as_digests(ht)[0] == rows_as_digests(ht)[1]
 
@@ -267,6 +277,7 @@ def hash_chunk(
         np.array([0], dtype=np_hsize_t),
         np.array([src_start], dtype=np_hsize_t),
         np.array([count], dtype=np_hsize_t),
+        np.array(count, dtype=np_hsize_t),
     )
     digest = rows_as_digests(ht)[0]
     idx = (slice(src_start, src_start + count[0]), *(slice(c) for c in count[1:]))
@@ -347,6 +358,7 @@ def hash_single_chunk(slab, count=None):
         np.array([0], dtype=np_hsize_t),
         np.array([0], dtype=np_hsize_t),
         np.array([count], dtype=np_hsize_t),
+        np.array(count, dtype=np_hsize_t),
     )
     return rows_as_digests(ht)[0]
 
@@ -467,6 +479,7 @@ def test_strided_slab_multichunk():
         np.array([1, 0], dtype=np_hsize_t),
         np.array(src_start, dtype=np_hsize_t),
         np.array(counts, dtype=np_hsize_t),
+        np.array([2, 10], dtype=np_hsize_t),
     )
     digests = rows_as_digests(ht)
     assert digests[1] == reference(slab[0:2, :10])
@@ -482,6 +495,7 @@ def test_transposed_slab_multichunk():
         np.array([0, 1], dtype=np_hsize_t),
         np.array([0, 5], dtype=np_hsize_t),
         np.array([(5, 4), (5, 3)], dtype=np_hsize_t),
+        np.array([5, 4], dtype=np_hsize_t),
     )
     digests = rows_as_digests(ht)
     assert digests[0] == reference(slab[0:5, :4])
@@ -562,12 +576,14 @@ def test_hypothesis_multichunk(slab_and_name, data):
     # hash_rows may repeat/permute freely
     hash_rows = np.arange(nchunks, dtype=np_hsize_t)[::-1].copy()
     ht = make_ht(nchunks)
+    counts_arr = np.array(counts, dtype=np_hsize_t)
     hash_slab(
         slab,
         ht,
         hash_rows,
         np.array(src_start, dtype=np_hsize_t),
-        np.array(counts, dtype=np_hsize_t),
+        counts_arr,
+        counts_arr.max(axis=0),
     )
     digests = rows_as_digests(ht)
     for i in range(nchunks):
@@ -660,6 +676,7 @@ def test_no_collision_multichunk_geometry():
         np.array([0, 1, 2, 3], dtype=np_hsize_t),
         np.array(starts, dtype=np_hsize_t),
         np.array(counts, dtype=np_hsize_t),
+        np.array([4, 4], dtype=np_hsize_t),
     )
     digests = rows_as_digests(ht)
     assert digests == [

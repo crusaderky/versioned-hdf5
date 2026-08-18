@@ -12,4 +12,5 @@ cpdef void hash_slab(
     hsize_t[::1] hash_rows,
     hsize_t[::1] src_start,
     hsize_t[:, ::1] count,
+    hsize_t[::1] chunk_size,
 ) except *
