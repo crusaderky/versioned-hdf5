@@ -2,14 +2,28 @@
 
 import hashlib
 import struct
-from contextlib import suppress
+from typing import Any
 
 import numpy as np
 
-with suppress(ImportError):  # Allow asv-compare vs. older releases
-    from versioned_hdf5.hash import hash_slab
-
 from .common import require_npystrings
+
+try:
+    from versioned_hdf5.hash import hash_slab
+except ImportError:  # Allow asv-compare vs. older releases
+    hash_slab = None
+
+# Neutralize the static signature, which may not match the installed release
+_hash_slab_any: Any = hash_slab
+
+
+def _hash_slab(src, hash_table, hash_rows, src_start, count, chunk_size):
+    """Call hash_slab, with or without the chunk_size parameter."""
+    if hash_slab.__code__.co_argcount > 5:
+        _hash_slab_any(src, hash_table, hash_rows, src_start, count, chunk_size)
+    else:
+        _hash_slab_any(src, hash_table, hash_rows, src_start, count)
+
 
 # 1 KiB, 64 KiB, 1 MiB of float64 per chunk
 CHUNK_SIZES = [(8, 16), (64, 128), (1024, 1024)]
@@ -40,7 +54,7 @@ class TimeHashSlab:
         self.chunk_size = np.array(chunk_size, dtype=np.uint64)
 
     def time_hash_slab(self, chunk_size, edge):
-        hash_slab(
+        _hash_slab(
             self.src,
             self.hash_table,
             self.hash_rows,
@@ -106,7 +120,7 @@ class TimeHashSlabNonContig:
         self.chunk_size = np.array(chunk_size, dtype=np.uint64)
 
     def time_hash_slab(self, layout, chunk_size):
-        hash_slab(
+        _hash_slab(
             self.src,
             self.hash_table,
             self.hash_rows,
@@ -161,7 +175,7 @@ class TimeHashSlabStrings:
         self.chunk_size = np.array(chunk_size, dtype=np.uint64)
 
     def time_hash_slab(self, dtype, max_nchars, chunk_size):
-        hash_slab(
+        _hash_slab(
             self.src,
             self.hash_table,
             self.hash_rows,

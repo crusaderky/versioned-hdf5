@@ -378,7 +378,8 @@ def test_transposed_3d():
 
 def test_fortran_order():
     slab = np.asfortranarray(np.arange(24, dtype="i2").reshape(4, 6))
-    assert slab.flags.f_contiguous and not slab.flags.c_contiguous
+    assert slab.flags.f_contiguous
+    assert not slab.flags.c_contiguous
     assert hash_single_chunk(slab) == reference(slab)
 
 
