@@ -1,4 +1,5 @@
 import enum
+import itertools
 from typing import Literal, NamedTuple
 
 import hypothesis
@@ -11,6 +12,8 @@ from numpy.testing import assert_equal
 from numpy.typing import DTypeLike
 from versioned_hdf5.slicetools import (
     RawDataView,
+    _ascontiguousarray_blocked,
+    _stride_perm,
     build_slab_indices_and_offsets,
     read_many_slices,
     spaceid_to_slice,
@@ -585,6 +588,70 @@ def test_read_many_slices_layouts(h5file, side, layout, shape):
         else:
             read_many_slices(src, dst, **params, fast=fast)
             np.testing.assert_array_equal(dst[...], expect, strict=True)
+
+
+def test_stride_perm():
+    """_stride_perm singles out the arrays whose axes are reordered vs. their memory
+    layout, which read_many_slices must make contiguous itself instead of letting
+    NumPy or h5py do it.
+    """
+    a = np.zeros((3, 4, 5))
+    assert _stride_perm(a) is None
+    # Slicing, stepping and reversing any axis preserves the order of the strides
+    assert _stride_perm(a[::2, ::-1, 1:3]) is None
+    assert _stride_perm(a.T) == (2, 1, 0)
+    assert _stride_perm(a.transpose(1, 0, 2)) == (1, 0, 2)
+    assert _stride_perm(np.asfortranarray(a)) == (2, 1, 0)
+
+    # Axes with a single point are left in place; reordering them is a no-op
+    b = np.zeros((3, 1, 5))
+    assert _stride_perm(b.transpose(1, 0, 2)) is None
+    assert _stride_perm(b.transpose(2, 1, 0)) == (2, 1, 0)
+
+
+@pytest.mark.parametrize("shape", [(6,), (5, 4), (3, 1, 4), (400, 3, 40)], ids=str)
+@pytest.mark.parametrize("layout", NumPyLayout)
+def test_ascontiguousarray_blocked(layout, shape):
+    """_ascontiguousarray_blocked is a drop-in replacement for np.ascontiguousarray,
+    whatever the permutation it's given. read_many_slices hoists the permutation out of
+    its loop, where a stepped slice may have invalidated it.
+
+    The largest shape is bigger than a tile, which exercises the recursive halving.
+    """
+    dtype = np.dtype(np.int32)
+    arr = make_array(shape, dtype, layout, "range")
+    expect = np.ascontiguousarray(arr)
+
+    for perm in itertools.permutations(range(len(shape))):
+        actual = _ascontiguousarray_blocked(arr, perm)
+        assert actual.flags.c_contiguous
+        np.testing.assert_array_equal(actual, expect, strict=True)
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        # Overlapping axes
+        np.lib.stride_tricks.sliding_window_view(np.arange(1, 8), 4),
+        # Zero strides
+        np.broadcast_to(np.arange(1, 5), (4, 4)),
+    ],
+    ids=["overlapping", "broadcast"],
+)
+def test_read_many_slices_overlapping_src(h5file, src):
+    """Arrays with overlapping axes can't be described by a hyperslab. They're
+    read-only, so they can only be the src of a transfer.
+    """
+    expect = np.zeros((4, 4), dtype=src.dtype)
+    read_many_slices(src, expect, [(0, 0)], [(0, 0)], [(4, 4)])
+    np.testing.assert_array_equal(expect, src, strict=True)
+
+    dst = h5file.create_dataset("a", shape=(4, 4), dtype=src.dtype, fillvalue=0)
+    read_many_slices(src, dst, [(0, 0)], [(0, 0)], [(4, 4)])
+    np.testing.assert_array_equal(dst[...], expect, strict=True)
+
+    with pytest.raises(ValueError, match="fast transfer is not possible"):
+        read_many_slices(src, dst, [(0, 0)], [(0, 0)], [(4, 4)], fast=True)
 
 
 def test_read_many_slices_not_fast_read_ok(h5file):

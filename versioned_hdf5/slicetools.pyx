@@ -824,6 +824,134 @@ cdef void _read_many_slices_h5_np (
                     raise HDF5Error()
 
 
+#: Max size of the tiles copied at a time by _ascontiguousarray_blocked.
+#: Both the tile and its transposed copy must comfortably fit in the CPU's L2 cache.
+cdef Py_ssize_t BLOCKED_COPY_TILE_BYTES = 1 << 17  # 128 KiB
+
+#: Don't bother with _ascontiguousarray_blocked if the innermost axis of the source's
+#: memory layout is shorter than a cache line; there would be nothing to memcpy.
+cdef Py_ssize_t BLOCKED_COPY_MIN_RUN_BYTES = 64
+
+
+cpdef tuple _stride_perm(np.ndarray arr):
+    """Return the permutation that sorts arr's axes by descending abs(stride), or None
+    if they are already sorted that way.
+
+    None means that arr's memory layout is C-like: visiting the array in row-major
+    order, which is what NumPy does when copying it to a C-contiguous array, walks its
+    buffer in as long strides as the layout allows. It covers contiguous arrays as well
+    as any view that slices, steps or reverses them, e.g. a[1:4], a[::2], a[:, ::-3].
+    A non-None return means that the axes are reordered vs. the memory layout, e.g.
+    a.T, a.transpose(1, 0, 2), or a Fortran-ordered array.
+
+    Axes with a single point are left in place, as NumPy sets their stride arbitrarily
+    and never applies it.
+    """
+    cdef int ndim = np.PyArray_NDIM(arr)
+    cdef np.npy_intp* shape = np.PyArray_DIMS(arr)
+    cdef np.npy_intp* strides = np.PyArray_STRIDES(arr)
+    cdef np.npy_intp[NPY_MAXDIMS] abs_strides
+    cdef int[NPY_MAXDIMS] pos  # multi-point axes, in C order
+    cdef int[NPY_MAXDIMS] perm  # ...and sorted by descending abs(stride)
+    cdef int naxes = 0
+    cdef int i, j, axis
+
+    for i in range(ndim):
+        abs_strides[i] = strides[i] if strides[i] >= 0 else -strides[i]
+        if shape[i] > 1:
+            pos[naxes] = i
+            perm[naxes] = i
+            naxes += 1
+
+    # Insertion sort; there can only be as many axes as NPY_MAXDIMS
+    for i in range(1, naxes):
+        axis = perm[i]
+        j = i
+        while j > 0 and abs_strides[perm[j - 1]] < abs_strides[axis]:
+            perm[j] = perm[j - 1]
+            j -= 1
+        perm[j] = axis
+
+    for i in range(naxes):
+        if perm[i] != pos[i]:
+            break
+    else:
+        return None
+
+    out = list(range(ndim))
+    for i in range(naxes):
+        out[pos[i]] = perm[i]
+    return tuple(out)
+
+
+cdef int _fastest_axis(np.ndarray arr):
+    """Return the axis with more than one point along which arr's buffer is walked in
+    the shortest strides, or 0 if there is no such axis.
+    """
+    cdef int ndim = np.PyArray_NDIM(arr)
+    cdef np.npy_intp* shape = np.PyArray_DIMS(arr)
+    cdef np.npy_intp* strides = np.PyArray_STRIDES(arr)
+    cdef np.npy_intp best = -1
+    cdef np.npy_intp stride
+    cdef int i, out = 0
+
+    for i in range(ndim):
+        if shape[i] > 1:
+            stride = strides[i] if strides[i] >= 0 else -strides[i]
+            if best < 0 or stride < best:
+                best = stride
+                out = i
+    return out
+
+
+def _ascontiguousarray_blocked(np.ndarray arr, tuple perm):
+    """Same as np.ascontiguousarray(arr), but up to 40x faster when ``perm``, from
+    _stride_perm(arr), is not None.
+
+    NumPy copies to a C-contiguous array by iterating over the axes in row-major order,
+    with no cache blocking. When the source's axes are reordered vs. its memory layout,
+    e.g. in a transposed array, this puts its longest stride in the innermost loop and
+    fetches one point per cache line, which measures 40x slower than memory bandwidth.
+
+    Work around it by copying one cache-sized tile at a time, and within each tile by
+    transiting through a temporary array laid out in the source's own memory order,
+    which NumPy can fill with long memcpy's.
+    """
+    out = np.empty_like(arr, order="C", subok=False)
+    _copy_blocked(arr, out, perm, _invert_perm(perm))
+    return out
+
+
+cdef tuple _invert_perm(tuple perm):
+    cdef list out = [0] * len(perm)
+    for i, axis in enumerate(perm):
+        out[axis] = i
+    return tuple(out)
+
+
+cdef void _copy_blocked(np.ndarray src, np.ndarray dst, tuple perm, tuple iperm):
+    """Helper of _ascontiguousarray_blocked. Recursively halve src and dst along their
+    longest axis until they fit in the CPU cache, then copy each tile.
+    """
+    cdef int ndim = np.PyArray_NDIM(src)
+    cdef np.npy_intp* shape = np.PyArray_DIMS(src)
+    cdef int axis = 0
+    cdef int j
+
+    if np.PyArray_NBYTES(src) > BLOCKED_COPY_TILE_BYTES:
+        for j in range(1, ndim):
+            if shape[j] > shape[axis]:
+                axis = j
+        if shape[axis] > 1:
+            head = (slice(None),) * axis + (slice(None, shape[axis] // 2),)
+            tail = (slice(None),) * axis + (slice(shape[axis] // 2, None),)
+            _copy_blocked(src[head], dst[head], perm, iperm)
+            _copy_blocked(src[tail], dst[tail], perm, iperm)
+            return
+
+    np.copyto(dst, src.transpose(perm).copy().transpose(iperm))
+
+
 @cython.wraparound(False)
 @cython.boundscheck(False)
 @cython.infer_types(True)
@@ -856,8 +984,34 @@ cdef void _read_many_slices_slow (
 
     An alternative approach would be to manually loop over the strides at least for
     basic item sizes (1, 2, 4, and 8 bytes). This has not been attempted yet.
+
+    When src is a NumPy array whose axes are reordered vs. its memory layout, e.g. a
+    transposed one, the copy to dst is made through _ascontiguousarray_blocked, which is
+    up to 40x faster than letting NumPy or h5py make the array contiguous.
     """
     nslices, ndim = src_start.shape[:2]
+
+    # Both h5py.Dataset.__setitem__ and NumPy, when dst is C-contiguous, iterate over
+    # the axes of src in row-major order. If src's axes are reordered vs. its memory
+    # layout, that means walking it with its longest stride in the innermost loop, which
+    # is pathologically slow; transpose it ourselves instead. Skip it if dst is a NumPy
+    # array with the same layout as src, as then NumPy already picks a sensible order.
+    cdef tuple perm = None
+    cdef int fastest_axis = 0
+    cdef hsize_t min_run = 0
+    if isinstance(src, np.ndarray):
+        perm = _stride_perm(src)
+        if (
+            perm is not None
+            and isinstance(dst, np.ndarray)
+            and _stride_perm(dst) == perm
+        ):
+            perm = None
+    if perm is not None:
+        # Note: a stepped slice of src may reorder its strides, and thus invalidate
+        # perm. This only makes the copy below potentially slower, never incorrect.
+        fastest_axis = _fastest_axis(src)
+        min_run = ceil_a_over_b(BLOCKED_COPY_MIN_RUN_BYTES, src.dtype.itemsize)
 
     for i in range(nslices):
         for j in range(ndim):
@@ -880,4 +1034,7 @@ cdef void _read_many_slices_slow (
                 src_idx.append(slice(src_start_ij, src_stop_ij, src_stride_ij))
                 dst_idx.append(slice(dst_start_ij, dst_stop_ij, dst_stride_ij))
 
-            dst[tuple(dst_idx)] = src[tuple(src_idx)]
+            src_block = src[tuple(src_idx)]
+            if perm is not None and count[i, fastest_axis] >= min_run:
+                src_block = _ascontiguousarray_blocked(src_block, perm)
+            dst[tuple(dst_idx)] = src_block
