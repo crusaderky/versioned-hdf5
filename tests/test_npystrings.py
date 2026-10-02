@@ -483,3 +483,87 @@ def test_datasetwrapper_resize(vfile):
         assert isinstance(ds.dataset, InMemorySparseDataset)
         assert ds.dataset._buffer.dtype.kind == "T"
         assert ds.dtype.kind == "O"
+
+
+def test_resize_then_astype_read_only_slab_metadata(vfile):
+    """Reading a staged dataset with ``astype("T")`` used to leave the slab metadata of
+    the ``StagedChangesArray`` read-only and shared with its copy-on-write source, so
+    committing raised ``ValueError: assignment destination is read-only``: issue #587.
+
+    The three sequences are: a whole-dataset assignment followed by a resize; a dataset
+    recreated after being deleted in an earlier version, whose name has no chunk in
+    ``raw_data`` yet; and a dataset replaced by assignment, i.e. a ``DatasetWrapper``
+    hot-swap, followed by a resize. Each version must be committed, not just staged.
+    """
+    # Resize after a whole-dataset assignment
+    with vfile.stage_version("v0") as v:
+        v.create_dataset(
+            "s0",
+            data=np.array(["a", "b", "c", "d"], dtype=object),
+            dtype=h5py.string_dtype(),
+            chunks=(2,),
+        )
+
+    with vfile.stage_version("v1") as v:
+        v["s0"][:] = np.array(["a", "b", "x", "y"], dtype=object)
+        v["s0"].resize((5,))
+        assert_array_equal(
+            v["s0"].astype("T")[:],
+            np.array(["a", "b", "x", "y", ""], dtype="T"),
+            strict=True,
+        )
+
+    assert vfile["v1"]["s0"].shape == (5,)
+    assert_object_array_equal(vfile["v1"]["s0"][:], ["a", "b", "x", "y", ""])
+
+    # Recreate a dataset deleted in an intermediate version
+    with vfile.stage_version("v2") as v:
+        v.create_dataset("t", data=np.arange(3))
+
+    with vfile.stage_version("v3") as v:
+        v.create_dataset("s1", shape=(4,), dtype=h5py.string_dtype(), chunks=(2,))
+        v["s1"][0] = "a"
+        assert_array_equal(
+            v["s1"].astype("T")[:],
+            np.array(["a", "", "", ""], dtype="T"),
+            strict=True,
+        )
+
+    assert vfile["v3"]["s1"].shape == (4,)
+    assert_object_array_equal(vfile["v3"]["s1"][:], ["a", "", "", ""])
+
+    with vfile.stage_version("v4") as v:
+        del v["s1"]
+
+    with vfile.stage_version("v5") as v:
+        v.create_dataset("s1", shape=(4,), dtype=h5py.string_dtype(), chunks=(2,))
+        v["s1"][0] = "a"
+        assert_array_equal(
+            v["s1"].astype("T")[:],
+            np.array(["a", "", "", ""], dtype="T"),
+            strict=True,
+        )
+
+    assert vfile["v5"]["s1"].shape == (4,)
+    assert_object_array_equal(vfile["v5"]["s1"][:], ["a", "", "", ""])
+
+    # Hot-swap an existing dataset, then resize it
+    with vfile.stage_version("v6") as v:
+        v.create_dataset(
+            "s2",
+            data=np.array(["a", "b", "c", "d"], dtype=object),
+            dtype=h5py.string_dtype(),
+            chunks=(2,),
+        )
+
+    with vfile.stage_version("v7") as v:
+        v["s2"] = np.array(["a", "b", "c"], dtype=object)
+        v["s2"].resize((5,))
+        assert_array_equal(
+            v["s2"].astype("T")[:],
+            np.array(["a", "b", "c", "", ""], dtype="T"),
+            strict=True,
+        )
+
+    assert vfile["v7"]["s2"].shape == (5,)
+    assert_object_array_equal(vfile["v7"]["s2"][:], ["a", "b", "c", "", ""])
