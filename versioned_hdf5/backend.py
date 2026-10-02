@@ -481,6 +481,18 @@ def commit_staged_changes(f, name: str, staged_changes: StagedChangesArray) -> N
     prev_n_chunks = int(hash_table.attrs["largest_index"])
     prev_len = prev_n_chunks * chunk_size0
 
+    # The rest of this function mutates the slab metadata in place, which needs private
+    # writeable arrays. StagedChangesArray.copy(), astype() and refill() hand out
+    # read-only views that are shared with the array they were copied from (the lazy
+    # Copy-on-Write copies of docs/staged_changes.rst), e.g. when DatasetWrapper
+    # hot-swaps a dataset and the user then reads it with astype("T"). Detach them here,
+    # as _setitem_plan, _resize_plan, _load_plan and _commit_plan do (`copy = copy or
+    # not self.slab_indices.flags.writeable`); mutating the shared arrays in place
+    # raises `assignment destination is read-only` and corrupts the CoW source.
+    if not sc.slab_indices.flags.writeable:
+        sc.slab_indices = sc.slab_indices.copy()
+        sc.slab_offsets = sc.slab_offsets.copy()
+
     # A InMemoryDataset has exactly one base slab (raw_data); a
     # InMemoryArrayDataset or InMemorySparseDataset has none.
     assert sc.n_base_slabs in (0, 1)

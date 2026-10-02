@@ -12,10 +12,12 @@ from versioned_hdf5.backend import (
     Filters,
     _chunk_blocks,
     _data_v4_to_sc_hash_table,
+    commit_staged_changes,
     create_base_dataset,
     rewrite_dataset,
     write_dataset,
 )
+from versioned_hdf5.staged_changes import StagedChangesArray
 
 CHUNK_SIZE_3D = 2**4  # = cbrt(DEFAULT_CHUNK_SIZE)
 
@@ -680,6 +682,45 @@ def test_data_v4_to_sc_hash_table_out_of_order(vfile):
     on_disk = np.ascontiguousarray(records["hash"]).view(np.uint64)
     actual = _data_v4_to_sc_hash_table(hash_table, 2)
     assert_equal(actual, on_disk[::-1])
+
+
+def test_commit_staged_changes_read_only_slab_metadata(vfile):
+    """A ``StagedChangesArray`` may hand out read-only slab metadata arrays that are
+    shared with another array: that is how ``copy()``, ``astype()`` and ``refill()``
+    implement lazy Copy-on-Write (docs/staged_changes.rst). `commit_staged_changes`
+    mutates those arrays, so it must take private writeable copies first; mutating them
+    in place raises and corrupts the array they were shared with.
+    """
+    with vfile.stage_version("r0") as sv:
+        sv.create_dataset("x", data=[1, 2, 3, 4], chunks=(2,))
+
+    # An array with no base slab whose chunks are staged in memory
+    src = StagedChangesArray.full(
+        shape=(4,), chunk_size=(2,), fill_value=0, dtype=np.int64
+    )
+    src[1:3] = [9, 8]
+    assert_equal(src.slab_indices, [1, 1])
+    assert_equal(src.slab_offsets, [0, 2])
+
+    # Same dtype: astype() just returns the lazy CoW copy, whose metadata arrays are
+    # read-only views of `src`'s
+    staged = src.astype(src.dtype)
+    assert not staged.slab_indices.flags.writeable
+
+    commit_staged_changes(vfile.f, "x", staged)
+
+    # The chunks of r0 and the chunk map of the CoW source must be untouched
+    assert_equal(vfile["r0"]["x"][:], [1, 2, 3, 4])
+    assert_equal(src.slab_indices, [1, 1])
+    assert_equal(src.slab_offsets, [0, 2])
+
+    # Both staged chunks are original, so they are appended after r0's two chunks,
+    # collapsed onto the single raw_data base slab
+    raw_data, hash_table = _raw_data_hashtable(vfile, "x")
+    assert_equal(raw_data[:8], [1, 2, 3, 4, 0, 9, 8, 0])
+    assert hash_table.attrs["largest_index"] == 4
+    assert_equal(staged.slab_indices, [1, 1])
+    assert_equal(staged.slab_offsets, [4, 6])
 
 
 def test_commit_staged_changes_out_of_order_hashtable(vfile):
